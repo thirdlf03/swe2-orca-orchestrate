@@ -210,8 +210,30 @@ def _submit_pending_paste(handle):
         time.sleep(2)
 
 
+def _send_prompt_devin(handle, prompt, retries=3):
+    """Send prompt into the devin TUI and verify it actually left the input
+    box. Devin renders unsubmitted input after '❭'; a sent message clears it.
+    Retries cover the 'prompt pasted but Enter never submitted' stall that
+    --permission-mode bypass cannot prevent (it's a TUI timing issue, not a
+    permission menu)."""
+    first = prompt.splitlines()[0][:30]
+    for _ in range(retries):
+        orca("terminal", "send", "--terminal", handle, "--text", prompt,
+             "--enter", check=False)
+        time.sleep(3)
+        _submit_pending_paste(handle)
+        deadline = time.time() + 45
+        while time.time() < deadline:
+            if not re.search(r"❭\s*" + re.escape(first), _screen_tail(handle)):
+                return True
+            time.sleep(2)
+    return False
+
+
 def _spawn_one(run, tid, name, model, base, setup, repo, st):
     """worktree -> devin terminal (bypass!) -> worker-start --terminal."""
+    model = _canonical_model(model)
+    _check_model_allowed(model)
     wargs = ["worktree", "create", "--name", name]
     if base:
         wargs += ["--base-branch", base]
@@ -257,14 +279,46 @@ def _spawn_one(run, tid, name, model, base, setup, repo, st):
     return rec
 
 
+# uids whose tier is Max (`devin models list`, 2026-09). Note swe-1-7 and
+# swe-1-7-lightning ARE max-tier despite lacking "-max" in the uid.
+MAX_TIER_UIDS = ("swe-2-max", "claude-opus-5-max",
+                 "swe-1-7", "swe-1-7-lightning")
+
+
+def _canonical_model(model):
+    """Expand the shorthands the playbook/usage use (medium/high/max)."""
+    return {"medium": "swe-2-medium", "high": "swe-2-high",
+            "max": "swe-2-max"}.get(model.strip().lower(), model.strip())
+
+
+def _check_model_allowed(model):
+    """Max-tier models are gated on ORCH_ALLOW (set by `orch boot --allow
+    swe-2-max`). Coordinators run orch inside the booted terminal, so the env
+    var is the mechanical allowlist — a coordinator ignoring the playbook
+    still dies here.
+
+    devin's --model accepts fuzzy names (alias or partial), so we can't just
+    compare == 'swe-2-max': 'max', 'swe-2-ma', or a bare family slug like
+    'swe-2' would slip through and resolve to a max variant. Block any input
+    containing 'max' plus any prefix of a known max-tier uid — an ambiguous
+    prefix like 'swe-2-m' dies too; use explicit variant names."""
+    m = model.strip().lower()
+    if ("max" in m or any(u.startswith(m) for u in MAX_TIER_UIDS)) \
+            and os.environ.get("ORCH_ALLOW") != "swe-2-max":
+        die(f"model '{model}' is max-tier: requires "
+            "`orch boot --allow swe-2-max` (ORCH_ALLOW unset)")
+
+
 def cmd_spawn(args):
     task = args.get("--task")
     if not task:
         die("usage: orch spawn --task <id> --name <n> [--model M] [--base B]")
     st = state_load()
     _, run = cur_run(st)
+    model = args.get("--model") or "swe-2-medium"
+    _check_model_allowed(model)
     rec = _spawn_one(run, task, args.get("--name") or f"w-{task[-6:]}",
-                     args.get("--model") or "swe-2-medium",
+                     model,
                      args.get("--base"), args.get("--setup") or "run",
                      args.get("--repo"), st)
     print(json.dumps(rec, indent=1))
@@ -280,6 +334,8 @@ def cmd_compete(args):
     models = [m.strip() for m in (args.get("--models") or "").split(",") if m.strip()]
     default_models = ["swe-2-high"] + ["swe-2-medium"] * (n - 1)
     models = (models + default_models)[:n]
+    for m in models:
+        _check_model_allowed(m)
     cluster = args.get("--cluster") or os.path.splitext(os.path.basename(spec_file))[0]
     spec = open(spec_file).read()
     st = state_load()
@@ -435,6 +491,8 @@ def cmd_integrate(args):
     branches = args.get("--branches")
     if not topic or not branches:
         die("usage: orch integrate --topic <t> --branches b1,b2 [--model M] [--verify 'cmd']")
+    integ_model = args.get("--model") or "swe-2-high"
+    _check_model_allowed(integ_model)
     tpl_path = os.path.join(HARNESS_DIR, "tasks", "integrator.template.md")
     tpl = open(tpl_path).read()
     spec = (tpl.replace("{{TOPIC}}", topic)
@@ -448,7 +506,7 @@ def cmd_integrate(args):
     run["tasks"][tid] = {"title": f"integ-{topic}", "cluster": f"integ:{topic}",
                          "deps": [], "dispatches": []}
     rec = _spawn_one(run, tid, f"integ-{topic}",
-                     args.get("--model") or "swe-2-high",
+                     integ_model,
                      args.get("--base"), args.get("--setup") or "run",
                      args.get("--repo"), st)
     print(json.dumps(rec, indent=1))
@@ -534,7 +592,13 @@ def cmd_boot(args):
     """Spawn a coordinator devin terminal that runs playbooks/coordinator.md."""
     files = args["_"]
     if not files:
-        die("usage: orch boot <requirement-file> [--model swe-2-max] [--worktree sel]")
+        die("usage: orch boot <requirement-file> [--allow swe-2-max] [--worktree sel]")
+    if args.get("--model"):
+        die("--model is gone: coordinator defaults to swe-2-high. "
+            "Use --allow swe-2-max to run the coordinator and workers on max")
+    allow = args.get("--allow")
+    if allow and allow != "swe-2-max":
+        die(f"unknown --allow value: {allow} (only swe-2-max is allow-able)")
     req = os.path.abspath(files[0])
     obj = open(req).read().strip().splitlines()[0][:200]
     r = orca("orchestration", "run-create", "--objective", obj)
@@ -545,23 +609,31 @@ def cmd_boot(args):
     st["current_run"] = rid
     state_save(st)
 
-    model = args.get("--model") or "swe-2-max"
+    # coordinator is swe-2-high by default; --allow swe-2-max upgrades the
+    # coordinator itself to max AND exports ORCH_ALLOW so workers can use it.
+    model = allow or "swe-2-high"
+    # Always set ORCH_ALLOW explicitly: `env ORCH_ALLOW=` (empty) clears a
+    # value leaked from the shell running `orch boot`, so --allow-less runs
+    # can't inherit max permission from the caller's environment.
+    cmd = (f"env ORCH_ALLOW={allow or ''} "
+           f"{DEVIN} --model {model} --permission-mode bypass")
     wt = _resolve_worktree(args)
     t = orca("terminal", "create", "--worktree", wt, "--title", "coordinator",
-             "--command", f"{DEVIN} --model {model} --permission-mode bypass")
+             "--command", cmd)
     handle = find_key(t, "handle")
-    orca("terminal", "wait", "--terminal", handle, "--for", "tui-idle",
-         "--timeout-ms", "240000", check=False)
+    _wait_devin_ready(handle)
     playbook = os.path.join(HARNESS_DIR, "playbooks", "coordinator.md")
     prompt = (
         f"あなたはこのRunのコーディネーターです。\n"
         f"1. まず `orca orchestration run-use --id {rid}` でこの端末をRunにbindする\n"
         f"2. {playbook} を読み、要件ファイル {req} に対して実行する\n"
-        f"3. ハーネスCLI: {HARNESS_DIR}/bin/orch (stateはこの端末のcwdの .orch/)"
+        f"3. ハーネスCLI: {HARNESS_DIR}/bin/orch (stateはこの端末のcwdの .orch/)\n"
+        f"4. モデル上限: {'swe-2-max まで使用可 (ORCH_ALLOW=swe-2-max が環境変数に設定済み)' if allow else 'swe-2-high まで。swe-2-max はこのRunでは禁止'}"
     )
-    orca("terminal", "send", "--terminal", handle, "--text", prompt,
-         "--enter", check=False)
-    print(json.dumps({"run": rid, "coordinator_terminal": handle}, indent=1))
+    ok = _send_prompt_devin(handle, prompt)
+    print(json.dumps({"run": rid, "coordinator_terminal": handle,
+                      "allow": allow or "swe-2-high",
+                      "prompt_submitted": ok}, indent=1))
 
 
 # ---------- dispatch ----------

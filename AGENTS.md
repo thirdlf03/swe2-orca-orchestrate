@@ -1,4 +1,4 @@
-# swe2-orca-orchestre
+# swe2-orca-orchestrate
 
 Orca + Devin CLI (SWE-2) を無制限に使う前提のマルチエージェント・
 オーケストレーションハーネス。
@@ -17,14 +17,13 @@ tasks/integrator.template.md  インテグレーター仕様テンプレ
 playbooks/coordinator.md  コーディネーターの行動規範(全自動時はこれを実行する端末を立てる)
 spec/run.example.json   オーケストレーション仕様IR(DAG・モデル配分・ゲート)
 hooks/no_blind_sleep.py 無条件sleepをブロックするPreToolUseフック
-docs/research.md        2026年マルチエージェント研究サーベイ(設計根拠)
 docs/findings/          sessions.db 追加分析
 ```
 
 ## アーキテクチャ
 
 ```
-人間 ──要件──> コーディネーター (swe-2-max, 対話 or `orch boot` で専用端末)
+人間 ──要件──> コーディネーター (default swe-2-high。`--allow swe-2-max` で coordinator 自体も max)
                   │ 分解・仕様化・採否・マージ判断(判断はここだけ)
                   ├─ 候補ワーカー群 (worktree分離・n案コンペ・モデル混合)
                   ├─ インテグレーター (採用ブランチ→integ/<topic>へ統合)
@@ -40,6 +39,7 @@ Orca の思想に合わせ、**スケジューラは作らない**。Run は名�
 | 失敗(実測) | 対策 | 場所 |
 |---|---|---|
 | 承認メニュー無言停止(5端末×15-30分) | `orch spawn` が必ず `--permission-mode bypass` で起動。残存は patrol が検出→`--rescue` で救出 | bin/orch |
+| プロンプトが入力欄に残りEnter未送信(実測: boot直後にcoordinator無言) | `_send_prompt_devin` で送信後に「入力欄から消えたか」を検証しリトライ。`terminal wait --for tui-idle` は devin を既知agentと認識せず早期returnするため使わない | bin/orch |
 | sleepポーリングで2h空費 | `orch wait` = `check --wait --types worker_done,escalation,question`+ackチェーン。heartbeat滞留はtypesフィルタで回避 | bin/orch |
 | heartbeat/ask 未使用(実測 hb計28回/ask 0) | 仕様テンプレに義務として全文埋め込み(プリアンブルは守られない実績) | tasks/template.md |
 | 統合が最遅ワーカー待ち | playbook の「採否確定→即integrate」。クラスタ単位でパイプライン | playbooks/coordinator.md |
@@ -63,14 +63,18 @@ orch status
 ```
 
 全自動モード: `orch boot requirement.md` がコーディネーター端末
-(swe-2-max, bypass)を立てて playbook を実行させる。人間は要件投入と
-最終マージ承認だけ。
+(swe-2-high, bypass)を立てて playbook を実行させる。
+`--allow swe-2-max` を付けると coordinator 自体が swe-2-max で起動し、
+`ORCH_ALLOW=swe-2-max` が環境変数に設定されてワーカー/インテグレーターにも
+max を配分できるようになる(ORCH_ALLOW 無しでの max 指定は orch が機械的に拒否)。
+人間は要件投入と最終マージ承認だけ。
 
 ## モデル配分(実測特性より)
 
 | 層 | モデル | 根拠 |
 |---|---|---|
-| コーディネーター | swe-2-max | 審査・採否・統合判断が主業務。仕様バグ検出力が最高 |
+| コーディネーター | swe-2-high。`--allow swe-2-max` なら max | 審査・採否・統合判断が主業務 |
+| max全般 | `orch boot --allow swe-2-max` のRunのみ | `ORCH_ALLOW` 無しでの max 指定は spawn/compete/integrate が機械的に die |
 | インテグレーター | swe-2-high | マージ方針の判断が成果物に直結 |
 | 候補ワーカー | 難易度で変える: 機械的=medium, 通常=high×1+medium, 創造/曖昧=high以上 | medium は曖昧仕様で確認せず進む実測あり |
 | レビュー/検証 | swe-2-medium〜high | チェックリスト型監査 |

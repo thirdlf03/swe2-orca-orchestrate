@@ -1,7 +1,7 @@
 {
   "objective": "例: ダッシュボードのUI改善",
   "repo": "path:/abs/path/to/repo",
-  "coordinator": {"model": "swe-2-max"},
+  "coordinator": {"model": "swe-2-high"},
   "defaults": {"base_branch": "main", "setup": "run", "verify": ["npx tsc --noEmit"]},
   "tasks": [
     {

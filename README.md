@@ -1,4 +1,4 @@
-# swe2-orca-orchestre
+# swe2-orca-orchestrate
 
 Orca + Devin CLI (SWE-2) 無制限前提のマルチエージェント・オーケストレーション
 ハーネス。詳細は [AGENTS.md](AGENTS.md) を参照。
