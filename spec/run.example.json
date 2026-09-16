@@ -1,0 +1,44 @@
+{
+  "objective": "例: ダッシュボードのUI改善",
+  "repo": "path:/abs/path/to/repo",
+  "coordinator": {"model": "swe-2-max"},
+  "defaults": {"base_branch": "main", "setup": "run", "verify": ["npx tsc --noEmit"]},
+  "tasks": [
+    {
+      "id": "ui-header",
+      "cluster": "ui",
+      "spec": "tasks/ui-header.md",
+      "write_scope": ["src/ui/**"],
+      "candidates": [
+        {"model": "swe-2-high"},
+        {"model": "swe-2-medium"},
+        {"model": "swe-2-medium"}
+      ],
+      "deps": []
+    },
+    {
+      "id": "copy-fix",
+      "cluster": "text",
+      "spec": "tasks/copy-fix.md",
+      "write_scope": ["src/copy/**"],
+      "candidates": [{"model": "swe-2-medium"}],
+      "deps": []
+    },
+    {
+      "id": "integ-ui",
+      "role": "integrator",
+      "topic": "ui",
+      "adopts": "ui-header",
+      "deps": ["ui-header"]
+    },
+    {
+      "id": "review-ui",
+      "role": "reviewer",
+      "target_branch": "integ/ui",
+      "model": "swe-2-medium",
+      "deps": ["integ-ui"]
+    }
+  ],
+  "gates": {"adopt": "coordinator", "merge": "human"},
+  "review_run": {"enabled": true, "model": "swe-2-medium"}
+}

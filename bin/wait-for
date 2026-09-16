@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# @description: 条件コマンドが成功するまでポーリング再実行する待機ツール
+# wait-for '<check command>' [--interval SEC] [--timeout SEC]
+# Re-runs <check command> until it exits 0. Exit 0 = condition met, 1 = timeout.
+# The sleep below lives inside a condition loop — allowed by no_blind_sleep hook.
+check="${1:-}"; shift || true
+interval=30; timeout=1800
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --interval) interval="$2"; shift 2;;
+    --timeout)  timeout="$2";  shift 2;;
+    *) echo "wait-for: unknown arg $1" >&2; exit 64;;
+  esac
+done
+if [ -z "$check" ]; then
+  echo "usage: wait-for '<check-cmd>' [--interval N] [--timeout N]" >&2; exit 64
+fi
+start=$(date +%s)
+while true; do
+  if eval "$check" >/dev/null 2>&1; then exit 0; fi
+  elapsed=$(( $(date +%s) - start ))
+  if [ "$elapsed" -ge "$timeout" ]; then
+    echo "wait-for: timeout after ${elapsed}s" >&2; exit 1
+  fi
+  sleep "$interval"
+done

@@ -1,0 +1,565 @@
+#!/usr/bin/env python3
+"""orch — Orca + SWE-2 orchestration harness.
+
+Thin but opinionated wrapper over the `orca` CLI. Encodes the measured
+failure-mode fixes so a coordinator agent (human-driven or swe-2) never
+re-derives them:
+
+  spawn    worker = new worktree + `devin --model X --permission-mode bypass`
+           terminal + supervised dispatch (worker-start --terminal)
+  wait     event-driven `check --wait --types ...` + ack chaining
+           (never sleep-polls; heartbeats can't spuriously wake it)
+  patrol   sweeps live dispatches: permission-menu stalls, silent workers
+  collect  settle report: dispatch -> outcome / branch / worktree
+  adopt    record which candidate won a competition
+  integrate spawn an integrator worker that merges adopted branches
+  clean    worker-release + worktree rm + terminal close (losers first)
+  boot     spawn a coordinator terminal running playbooks/coordinator.md
+  task     task-create wrapper (deps-aware)
+  status   dashboard of run/tasks/dispatches
+
+Local state (dispatch -> worktree/branch/terminal) lives in
+`.orch/state.json` in the current directory. Add `.orch/` to .gitignore.
+
+Requires: orca CLI on PATH (or $ORCA_CLI_COMMAND), devin CLI for workers.
+Python 3.9+, stdlib only.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+ORCA = os.environ.get("ORCA_CLI_COMMAND", "orca")
+DEVIN = os.environ.get("ORCH_DEVIN_CMD", "devin")
+STATE_DIR = ".orch"
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+
+HARNESS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+# ---------- low-level ----------
+
+def die(msg, code=1):
+    sys.stderr.write(f"orch: {msg}\n")
+    sys.exit(code)
+
+
+def orca(*args, check=True, timeout=None):
+    """Run `orca <args> --json`, return parsed .result (or whole doc)."""
+    cmd = [ORCA, *args, "--json"]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        die(f"timeout: {' '.join(cmd)}")
+    if p.returncode != 0:
+        if check:
+            die(f"`{' '.join(cmd)}` failed:\n{p.stderr or p.stdout}")
+        return None
+    try:
+        doc = json.loads(p.stdout)
+    except json.JSONDecodeError:
+        if check:
+            die(f"bad json from `{' '.join(cmd)}`:\n{p.stdout[:400]}")
+        return None
+    if isinstance(doc, dict) and doc.get("ok") is False and check:
+        die(f"orca error: {json.dumps(doc)[:600]}")
+    return doc.get("result", doc) if isinstance(doc, dict) else doc
+
+
+def dig(obj, *keys, default=None):
+    """Tolerant nested lookup: dig(x, 'a','b') finds first x['a']['b'],
+    also tries obj['result'] prefix and any nested dict containing the key."""
+    for k in keys:
+        if isinstance(obj, dict) and k in obj:
+            obj = obj[k]
+        else:
+            return default
+    return obj
+
+
+def find_key(obj, key, default=None):
+    """BFS for first occurrence of `key` in nested dict/list."""
+    q = [obj]
+    while q:
+        o = q.pop(0)
+        if isinstance(o, dict):
+            if key in o:
+                return o[key]
+            q.extend(o.values())
+        elif isinstance(o, list):
+            q.extend(o)
+    return default
+
+
+# ---------- state ----------
+
+def state_load():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {"runs": {}}
+
+
+def state_save(st):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, STATE_FILE)
+
+
+def cur_run(st):
+    rid = st.get("current_run")
+    if not rid or rid not in st["runs"]:
+        die("no current run (state file has none). Run `orch run create` first.")
+    return rid, st["runs"][rid]
+
+
+# ---------- commands ----------
+
+def cmd_init(args):
+    """Register cwd repo with Orca (idempotent) + prepare .orch/."""
+    path = os.path.abspath(args.get("--repo") or os.getcwd())
+    repos = find_key(orca("repo", "list"), "repos", []) or []
+    hit = next((r for r in repos if r.get("path") == path), None)
+    if hit:
+        print(f"repo already registered: {hit['id']} ({hit.get('displayName')})")
+    else:
+        r = orca("repo", "add", "--path", path)
+        print(f"repo added: {json.dumps(r)[:300]}")
+    os.makedirs(STATE_DIR, exist_ok=True)
+    gi = os.path.join(path, ".gitignore")
+    try:
+        cur = open(gi).read()
+    except FileNotFoundError:
+        cur = ""
+    if ".orch/" not in cur:
+        with open(gi, "a") as f:
+            f.write(("\n" if cur and not cur.endswith("\n") else "") + ".orch/\n")
+        print(".gitignore += .orch/")
+
+
+def cmd_run_create(args):
+    obj = " ".join(args["_"])
+    if not obj:
+        die("usage: orch run create <objective>")
+    r = orca("orchestration", "run-create", "--objective", obj)
+    rid = find_key(r, "id") or find_key(r, "runId")
+    st = state_load()
+    st["runs"][rid] = {"objective": obj, "created_at": int(time.time()),
+                     "tasks": {}, "dispatches": {}}
+    st["current_run"] = rid
+    state_save(st)
+    print(json.dumps({"run": rid}, indent=1))
+
+
+def cmd_task_create(args):
+    files = args["_"]
+    if not files:
+        die("usage: orch task create <spec-file>... [--deps a,b] [--cluster C]")
+    deps = json.dumps([d for d in (args.get("--deps") or "").split(",") if d])
+    st = state_load()
+    rid, run = cur_run(st)
+    out = []
+    for f in files:
+        spec = open(f).read()
+        title = args.get("--title") or os.path.splitext(os.path.basename(f))[0]
+        r = orca("orchestration", "task-create", "--spec", spec,
+                 "--task-title", title, "--deps", deps, "--run", rid)
+        tid = find_key(r, "id") or find_key(r, "taskId")
+        run["tasks"][tid] = {"title": title, "spec_file": f,
+                             "cluster": args.get("--cluster"),
+                             "deps": json.loads(deps), "dispatches": []}
+        out.append({"task": tid, "title": title})
+    state_save(st)
+    print(json.dumps(out, indent=1))
+
+
+def _spawn_one(run, tid, name, model, base, setup, repo, st):
+    """worktree -> devin terminal (bypass!) -> worker-start --terminal."""
+    wargs = ["worktree", "create", "--name", name]
+    if base:
+        wargs += ["--base-branch", base]
+    if repo:
+        wargs += ["--repo", repo]
+    if setup:
+        wargs += ["--setup", setup]
+    w = orca(*wargs)
+    wid = find_key(w, "id")
+    branch = find_key(w, "branch") or ""
+    branch = re.sub(r"^refs/heads/", "", branch)
+    wpath = find_key(w, "path")
+    if not wid:
+        die(f"worktree create: no id in {json.dumps(w)[:400]}")
+
+    cmd = f"{DEVIN} --model {model} --permission-mode bypass"
+    t = orca("terminal", "create", "--worktree", f"id:{wid}",
+             "--title", name, "--command", cmd)
+    handle = find_key(t, "handle")
+    if not handle:
+        die(f"terminal create: no handle in {json.dumps(t)[:400]}")
+    # devin TUI readiness; tolerate timeout (prompt delivery retried by worker-start)
+    orca("terminal", "wait", "--terminal", handle, "--for", "tui-idle",
+         "--timeout-ms", "180000", check=False)
+
+    ws = orca("orchestration", "worker-start", "--task", tid,
+              "--terminal", handle, "--worktree", f"id:{wid}")
+    did = find_key(ws, "dispatchId") or find_key(ws, "dispatch") or find_key(ws, "id")
+    rec = {"dispatch": did, "task": tid, "name": name, "model": model,
+           "worktree": wid, "path": wpath, "branch": branch,
+           "terminal": handle, "spawned_at": int(time.time()),
+           "status": "active", "adopted": False}
+    run["dispatches"][did] = rec
+    run["tasks"].setdefault(tid, {}).setdefault("dispatches", []).append(did)
+    state_save(st)
+    return rec
+
+
+def cmd_spawn(args):
+    task = args.get("--task")
+    if not task:
+        die("usage: orch spawn --task <id> --name <n> [--model M] [--base B]")
+    st = state_load()
+    _, run = cur_run(st)
+    rec = _spawn_one(run, task, args.get("--name") or f"w-{task[-6:]}",
+                     args.get("--model") or "swe-2-medium",
+                     args.get("--base"), args.get("--setup") or "run",
+                     args.get("--repo"), st)
+    print(json.dumps(rec, indent=1))
+
+
+def cmd_compete(args):
+    """Create N candidate tasks from one spec and spawn a worker each."""
+    files = args["_"]
+    if not files:
+        die("usage: orch compete <spec-file> -n 3 [--models high,medium,medium] [--cluster C] [--base B]")
+    spec_file = files[0]
+    n = int(args.get("-n") or 3)
+    models = [m.strip() for m in (args.get("--models") or "").split(",") if m.strip()]
+    default_models = ["swe-2-high"] + ["swe-2-medium"] * (n - 1)
+    models = (models + default_models)[:n]
+    cluster = args.get("--cluster") or os.path.splitext(os.path.basename(spec_file))[0]
+    spec = open(spec_file).read()
+    st = state_load()
+    rid, run = cur_run(st)
+    recs = []
+    for i in range(n):
+        title = f"{cluster}-{i+1}"
+        r = orca("orchestration", "task-create", "--spec", spec,
+                 "--task-title", title, "--run", rid)
+        tid = find_key(r, "id") or find_key(r, "taskId")
+        run["tasks"][tid] = {"title": title, "spec_file": spec_file,
+                             "cluster": cluster, "deps": [], "dispatches": []}
+        rec = _spawn_one(run, tid, f"w-{title}", models[i],
+                         args.get("--base"), args.get("--setup") or "run",
+                         args.get("--repo"), st)
+        recs.append(rec)
+    print(json.dumps(recs, indent=1))
+
+
+WAIT_TYPES = "worker_done,escalation,question"
+
+
+def _normalize_msg(m):
+    return {
+        "type": m.get("type"),
+        "from": m.get("from") or m.get("fromHandle"),
+        "subject": m.get("subject"),
+        "body": (m.get("body") or "")[:600],
+        "task": find_key(m, "taskId"),
+        "dispatch": find_key(m, "dispatchId"),
+        "id": m.get("id") or m.get("messageId"),
+    }
+
+
+def cmd_wait(args):
+    timeout = float(args.get("--timeout-min") or 60) * 60
+    st = state_load()
+    _, run = cur_run(st)
+    known = set(run["dispatches"])
+    settled = set()
+    deadline = time.time() + timeout
+    ack = None
+    while time.time() < deadline:
+        remain_ms = int(max(5_000, min(300_000, (deadline - time.time()) * 1000)))
+        cargs = ["orchestration", "check", "--wait",
+                 "--types", WAIT_TYPES, "--timeout-ms", str(remain_ms)]
+        if ack:
+            cargs += ["--ack", ack]
+        r = orca(*cargs, check=False, timeout=remain_ms / 1000 + 30)
+        if r is None:
+            continue
+        delivery = r if isinstance(r, dict) else {}
+        msgs = find_key(delivery, "messages", []) or []
+        did_ack = find_key(delivery, "deliveryId") or delivery.get("id")
+        for m in msgs:
+            nm = _normalize_msg(m)
+            print(json.dumps(nm, ensure_ascii=False), flush=True)
+            if nm["type"] in ("worker_done", "escalation") and nm["dispatch"]:
+                settled.add(nm["dispatch"])
+        if did_ack:
+            ack = str(did_ack)
+            # ack is chained into the next check call (--ack + --wait)
+        if args.get("--settle-all") and known and settled >= known:
+            break
+    print(json.dumps({"settled": sorted(settled),
+                      "pending": sorted(known - settled)}))
+
+
+def _permission_menu_key(text):
+    """Find the menu number for 'bypass' in a devin permission menu."""
+    for m in re.finditer(r"(?m)^\s*[\[>]?\s*(\d)[).:\]]?\s+.*bypass", text, re.I):
+        return m.group(1)
+    return None
+
+
+def cmd_patrol(args):
+    st = state_load()
+    _, run = cur_run(st)
+    stale_s = float(args.get("--stale-min") or 12) * 60
+    now = time.time()
+    report = []
+    for did, d in run["dispatches"].items():
+        if d.get("status") != "active":
+            continue
+        entry = {"dispatch": did, "name": d["name"], "issues": []}
+        ws = orca("orchestration", "worker-show", "--dispatch", did, check=False)
+        wstate = (find_key(ws, "status") or find_key(ws, "state") or "?") if ws else "?"
+        entry["worker_state"] = wstate
+        t = orca("terminal", "read", "--terminal", d["terminal"],
+                 "--screen", check=False)
+        text = json.dumps(t) if t else ""
+        tail = text[-2000:]
+        key = _permission_menu_key(tail)
+        if key:
+            entry["issues"].append("permission-menu")
+            if args.get("--rescue"):
+                orca("terminal", "send", "--terminal", d["terminal"],
+                     "--text", key, check=False)
+                time.sleep(1)
+                orca("terminal", "send", "--terminal", d["terminal"],
+                     "--enter", check=False)
+                entry["issues"].append(f"rescued:key={key}")
+        idle = now - d.get("spawned_at", now)
+        if idle > stale_s and wstate in ("ready", "running", "active", "?"):
+            # no heartbeat tracking in state file; flag long-running actives for eyeball
+            entry["issues"].append(f"running>{int(idle/60)}m")
+        report.append(entry)
+    print(json.dumps(report, indent=1, ensure_ascii=False))
+
+
+def cmd_collect(args):
+    st = state_load()
+    _, run = cur_run(st)
+    rows = []
+    for did, d in run["dispatches"].items():
+        ws = orca("orchestration", "worker-show", "--dispatch", did, check=False)
+        rows.append({
+            "dispatch": did, "name": d["name"], "model": d["model"],
+            "branch": d.get("branch"), "path": d.get("path"),
+            "status": find_key(ws, "status") or find_key(ws, "state") or d["status"],
+            "outcome": find_key(ws, "outcome"),
+            "adopted": d.get("adopted", False),
+        })
+    print(json.dumps(rows, indent=1, ensure_ascii=False))
+
+
+def cmd_adopt(args):
+    did = args.get("--dispatch")
+    if not did:
+        die("usage: orch adopt --dispatch <id>")
+    st = state_load()
+    _, run = cur_run(st)
+    if did not in run["dispatches"]:
+        die(f"unknown dispatch {did}")
+    run["dispatches"][did]["adopted"] = True
+    state_save(st)
+    print(json.dumps({"adopted": did,
+                      "branch": run["dispatches"][did].get("branch")}))
+
+
+def cmd_integrate(args):
+    """Spawn an integrator worker that merges adopted branches."""
+    topic = args.get("--topic")
+    branches = args.get("--branches")
+    if not topic or not branches:
+        die("usage: orch integrate --topic <t> --branches b1,b2 [--model M] [--verify 'cmd']")
+    tpl_path = os.path.join(HARNESS_DIR, "tasks", "integrator.template.md")
+    tpl = open(tpl_path).read()
+    spec = (tpl.replace("{{TOPIC}}", topic)
+               .replace("{{BRANCHES}}", branches)
+               .replace("{{VERIFY}}", args.get("--verify") or "(repo の検証コマンド)"))
+    st = state_load()
+    rid, run = cur_run(st)
+    r = orca("orchestration", "task-create", "--spec", spec,
+             "--task-title", f"integ-{topic}", "--run", rid)
+    tid = find_key(r, "id") or find_key(r, "taskId")
+    run["tasks"][tid] = {"title": f"integ-{topic}", "cluster": f"integ:{topic}",
+                         "deps": [], "dispatches": []}
+    rec = _spawn_one(run, tid, f"integ-{topic}",
+                     args.get("--model") or "swe-2-high",
+                     args.get("--base"), args.get("--setup") or "run",
+                     args.get("--repo"), st)
+    print(json.dumps(rec, indent=1))
+
+
+def cmd_clean(args):
+    st = state_load()
+    _, run = cur_run(st)
+    targets = []
+    if args.get("--all"):
+        targets = list(run["dispatches"])
+    elif args.get("--losers"):
+        targets = [d for d, r in run["dispatches"].items() if not r.get("adopted")]
+    else:
+        targets = [d for d in args["_"] ]
+        if args.get("--dispatch"):
+            targets.append(args["--dispatch"])
+    if not targets:
+        die("usage: orch clean <dispatch>... | --losers | --all")
+    done = []
+    for did in targets:
+        d = run["dispatches"].get(did)
+        if not d:
+            continue
+        orca("orchestration", "worker-release", "--dispatch", did, check=False)
+        if d.get("worktree"):
+            orca("worktree", "rm", "--worktree", f"id:{d['worktree']}",
+                 "--force", check=False)
+            tl = orca("terminal", "list", "--worktree", f"id:{d['worktree']}",
+                      check=False)
+            for t in (find_key(tl, "terminals", []) or []):
+                h = t.get("handle")
+                if h:
+                    orca("terminal", "close", "--terminal", h, check=False)
+        d["status"] = "released"
+        done.append(did)
+    state_save(st)
+    print(json.dumps({"released": done}))
+
+
+def cmd_status(args):
+    st = state_load()
+    rid, run = cur_run(st)
+    tasks = orca("orchestration", "task-list", "--run", rid, "--brief",
+                 check=False) or {}
+    print(json.dumps({
+        "run": rid, "objective": run["objective"],
+        "tasks": find_key(tasks, "tasks", tasks),
+        "dispatches": [
+            {"dispatch": k, "name": v["name"], "model": v["model"],
+             "status": v["status"], "adopted": v["adopted"],
+             "branch": v.get("branch"), "age_min": int((time.time() - v["spawned_at"]) / 60)}
+            for k, v in run["dispatches"].items()],
+    }, indent=1, ensure_ascii=False))
+
+
+def _resolve_worktree(args):
+    """--worktree flag > current Orca worktree > repo main worktree of cwd."""
+    if args.get("--worktree"):
+        return args["--worktree"]
+    cur = orca("worktree", "current", check=False)
+    wid = find_key(cur, "id") if cur else None
+    if wid:
+        return f"id:{wid}"
+    cwd = os.path.abspath(os.getcwd())
+    repos = find_key(orca("repo", "list"), "repos", []) or []
+    repo = next((r for r in repos if cwd.startswith(r["path"])), None)
+    if repo:
+        wts = find_key(orca("worktree", "list", "--repo", f"id:{repo['id']}"),
+                       "worktrees", []) or []
+        main = next((w for w in wts if w.get("isMainWorktree")), None)
+        if main:
+            return f"id:{main['id']}"
+    die("cannot resolve worktree: run inside an Orca-managed repo or pass --worktree")
+
+
+def cmd_boot(args):
+    """Spawn a coordinator devin terminal that runs playbooks/coordinator.md."""
+    files = args["_"]
+    if not files:
+        die("usage: orch boot <requirement-file> [--model swe-2-max] [--worktree sel]")
+    req = os.path.abspath(files[0])
+    obj = open(req).read().strip().splitlines()[0][:200]
+    r = orca("orchestration", "run-create", "--objective", obj)
+    rid = find_key(r, "id") or find_key(r, "runId")
+    st = state_load()
+    st["runs"][rid] = {"objective": obj, "created_at": int(time.time()),
+                     "tasks": {}, "dispatches": {}}
+    st["current_run"] = rid
+    state_save(st)
+
+    model = args.get("--model") or "swe-2-max"
+    wt = _resolve_worktree(args)
+    t = orca("terminal", "create", "--worktree", wt, "--title", "coordinator",
+             "--command", f"{DEVIN} --model {model} --permission-mode bypass")
+    handle = find_key(t, "handle")
+    orca("terminal", "wait", "--terminal", handle, "--for", "tui-idle",
+         "--timeout-ms", "240000", check=False)
+    playbook = os.path.join(HARNESS_DIR, "playbooks", "coordinator.md")
+    prompt = (
+        f"あなたはこのRunのコーディネーターです。\n"
+        f"1. まず `orca orchestration run-use --id {rid}` でこの端末をRunにbindする\n"
+        f"2. {playbook} を読み、要件ファイル {req} に対して実行する\n"
+        f"3. ハーネスCLI: {HARNESS_DIR}/bin/orch (stateはこの端末のcwdの .orch/)"
+    )
+    orca("terminal", "send", "--terminal", handle, "--text", prompt,
+         "--enter", check=False)
+    print(json.dumps({"run": rid, "coordinator_terminal": handle}, indent=1))
+
+
+# ---------- dispatch ----------
+
+COMMANDS = {
+    "init": cmd_init,
+    "run create": cmd_run_create,
+    "task create": cmd_task_create,
+    "spawn": cmd_spawn,
+    "compete": cmd_compete,
+    "wait": cmd_wait,
+    "patrol": cmd_patrol,
+    "collect": cmd_collect,
+    "adopt": cmd_adopt,
+    "integrate": cmd_integrate,
+    "clean": cmd_clean,
+    "status": cmd_status,
+    "boot": cmd_boot,
+}
+
+
+def parse(argv):
+    """Split argv into (command, {flags, _ positional})."""
+    for n in (2, 1):
+        cand = " ".join(argv[:n])
+        if cand in COMMANDS:
+            rest = argv[n:]
+            break
+    else:
+        die(f"unknown command: {' '.join(argv[:2])}\ncommands: "
+            + ", ".join(sorted(COMMANDS)))
+    args = {"_": []}
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a.startswith("-"):
+            if i + 1 < len(rest) and not rest[i + 1].startswith("--"):
+                args[a] = rest[i + 1]
+                i += 2
+            else:
+                args[a] = True
+                i += 1
+        else:
+            args["_"].append(a)
+            i += 1
+    return cand, args
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print(__doc__)
+        sys.exit(0)
+    name, args = parse(sys.argv[1:])
+    COMMANDS[name](args)
