@@ -178,6 +178,38 @@ def cmd_task_create(args):
     print(json.dumps(out, indent=1))
 
 
+DEVIN_READY = re.compile(r"SWE-2\s+(Medium|High|Max)|Use /clear|Guide Devin")
+
+
+def _screen_tail(handle, n=40):
+    t = orca("terminal", "read", "--terminal", handle, "--screen",
+             check=False)
+    tail = find_key(t, "tail", []) or []
+    return "\n".join(tail[-n:])
+
+
+def _wait_devin_ready(handle, timeout_s=180):
+    """Poll the terminal screen until the devin TUI is initialized.
+
+    `terminal wait --for tui-idle` does not recognize devin (not a known
+    agent) and can return before the TUI can accept injected input —
+    injecting early makes worker-start stall at dispatch_input
+    (agent_prompt_stalled: prompt pasted but Enter never submitted)."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if DEVIN_READY.search(_screen_tail(handle)):
+            return True
+        time.sleep(2)
+    return False
+
+
+def _submit_pending_paste(handle):
+    """If a '[Pasted text ...]' blob sits unsubmitted in devin's input, send Enter."""
+    if re.search(r"\[Pasted text #\d+", _screen_tail(handle)):
+        orca("terminal", "send", "--terminal", handle, "--enter", check=False)
+        time.sleep(2)
+
+
 def _spawn_one(run, tid, name, model, base, setup, repo, st):
     """worktree -> devin terminal (bypass!) -> worker-start --terminal."""
     wargs = ["worktree", "create", "--name", name]
@@ -201,12 +233,19 @@ def _spawn_one(run, tid, name, model, base, setup, repo, st):
     handle = find_key(t, "handle")
     if not handle:
         die(f"terminal create: no handle in {json.dumps(t)[:400]}")
-    # devin TUI readiness; tolerate timeout (prompt delivery retried by worker-start)
-    orca("terminal", "wait", "--terminal", handle, "--for", "tui-idle",
-         "--timeout-ms", "180000", check=False)
+    _wait_devin_ready(handle)
 
     ws = orca("orchestration", "worker-start", "--task", tid,
-              "--terminal", handle, "--worktree", f"id:{wid}")
+              "--terminal", handle, "--worktree", f"id:{wid}", check=False)
+    # devin is not a known-agent: if the prompt landed but stalled at the
+    # input box ([Pasted text ...] unsubmitted), press Enter once to submit.
+    if not ws or find_key(ws, "lastError") == "agent_prompt_stalled" \
+            or find_key(ws, "state") == "failed":
+        _submit_pending_paste(handle)
+        ws = orca("orchestration", "worker-start", "--task", tid,
+                  "--terminal", handle, "--worktree", f"id:{wid}", check=False)
+    if not ws or find_key(ws, "state") == "failed":
+        die(f"worker-start failed: {json.dumps(ws)[:600]}")
     did = find_key(ws, "dispatchId") or find_key(ws, "dispatch") or find_key(ws, "id")
     rec = {"dispatch": did, "task": tid, "name": name, "model": model,
            "worktree": wid, "path": wpath, "branch": branch,
@@ -264,13 +303,22 @@ WAIT_TYPES = "worker_done,escalation,question"
 
 
 def _normalize_msg(m):
+    payload = m.get("payload")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            payload = {}
+    payload = payload or {}
     return {
         "type": m.get("type"),
-        "from": m.get("from") or m.get("fromHandle"),
+        "from": m.get("from_handle") or m.get("from") or m.get("fromHandle"),
         "subject": m.get("subject"),
         "body": (m.get("body") or "")[:600],
-        "task": find_key(m, "taskId"),
-        "dispatch": find_key(m, "dispatchId"),
+        "task": payload.get("taskId") or m.get("task_id"),
+        "dispatch": payload.get("dispatchId") or m.get("dispatch_id"),
+        "outcome": payload.get("outcome"),
+        "files": payload.get("filesModified"),
         "id": m.get("id") or m.get("messageId"),
     }
 
@@ -435,6 +483,11 @@ def cmd_clean(args):
                 h = t.get("handle")
                 if h:
                     orca("terminal", "close", "--terminal", h, check=False)
+        # `worktree rm --force` does not delete the branch; drop the loser's
+        # branch too (adopted branches are kept until integration completes).
+        if d.get("branch") and not d.get("adopted"):
+            subprocess.run(["git", "branch", "-D", d["branch"]],
+                           capture_output=True)
         d["status"] = "released"
         done.append(did)
     state_save(st)
