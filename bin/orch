@@ -13,7 +13,9 @@ re-derives them:
   collect  settle report: dispatch -> outcome / branch / worktree
   adopt    record which candidate won a competition
   integrate spawn an integrator worker that merges adopted branches
-  clean    worker-release + worktree rm + terminal close (losers first)
+  clean    worker-release + worktree rm + terminal close
+           (--losers = only candidates that verifiably lost a decided
+           competition; live integrators/undecided candidates never match)
   boot     spawn a coordinator terminal running playbooks/coordinator.md
   task     task-create wrapper (deps-aware)
   status   dashboard of run/tasks/dispatches
@@ -230,7 +232,7 @@ def _send_prompt_devin(handle, prompt, retries=3):
     return False
 
 
-def _spawn_one(run, tid, name, model, base, setup, repo, st):
+def _spawn_one(run, tid, name, model, base, setup, repo, st, role="worker"):
     """worktree -> devin terminal (bypass!) -> worker-start --terminal."""
     model = _canonical_model(model)
     _check_model_allowed(model)
@@ -270,7 +272,7 @@ def _spawn_one(run, tid, name, model, base, setup, repo, st):
         die(f"worker-start failed: {json.dumps(ws)[:600]}")
     did = find_key(ws, "dispatchId") or find_key(ws, "dispatch") or find_key(ws, "id")
     rec = {"dispatch": did, "task": tid, "name": name, "model": model,
-           "worktree": wid, "path": wpath, "branch": branch,
+           "role": role, "worktree": wid, "path": wpath, "branch": branch,
            "terminal": handle, "spawned_at": int(time.time()),
            "status": "active", "adopted": False}
     run["dispatches"][did] = rec
@@ -350,7 +352,7 @@ def cmd_compete(args):
                              "cluster": cluster, "deps": [], "dispatches": []}
         rec = _spawn_one(run, tid, f"w-{title}", models[i],
                          args.get("--base"), args.get("--setup") or "run",
-                         args.get("--repo"), st)
+                         args.get("--repo"), st, role="candidate")
         recs.append(rec)
     print(json.dumps(recs, indent=1))
 
@@ -480,6 +482,7 @@ def cmd_adopt(args):
     if did not in run["dispatches"]:
         die(f"unknown dispatch {did}")
     run["dispatches"][did]["adopted"] = True
+    run["dispatches"][did]["adopted_at"] = int(time.time())
     state_save(st)
     print(json.dumps({"adopted": did,
                       "branch": run["dispatches"][did].get("branch")}))
@@ -508,28 +511,73 @@ def cmd_integrate(args):
     rec = _spawn_one(run, tid, f"integ-{topic}",
                      integ_model,
                      args.get("--base"), args.get("--setup") or "run",
-                     args.get("--repo"), st)
+                     args.get("--repo"), st, role="integrator")
     print(json.dumps(rec, indent=1))
+
+
+def _cluster_of(run, rec):
+    """Cluster a dispatch belongs to (via its task). None for clusterless."""
+    return (run["tasks"].get(rec.get("task")) or {}).get("cluster")
+
+
+def _loser_ids(run):
+    """Dispatches that verifiably LOST a decided competition: un-adopted,
+    and their cluster has a sibling adopted after they were spawned.
+
+    `--losers` must never mean "everything un-adopted": integrators,
+    reviewers and retried candidates are always un-adopted, and a measured
+    incident had `clean --losers` kill a freshly spawned integrator.
+    Candidates spawned AFTER their cluster's decision (retries) are kept."""
+    disp = run["dispatches"]
+    out = []
+    for did, d in disp.items():
+        if d.get("adopted") or d.get("status") == "released":
+            continue
+        cl = _cluster_of(run, d)
+        if not cl:
+            continue
+        decided_at = max((s.get("adopted_at", float("inf"))
+                          for s in disp.values()
+                          if s.get("adopted") and _cluster_of(run, s) == cl),
+                         default=None)
+        if decided_at is not None and d.get("spawned_at", 0) <= decided_at:
+            out.append(did)
+    return out
 
 
 def cmd_clean(args):
     st = state_load()
     _, run = cur_run(st)
-    targets = []
+    disp = run["dispatches"]
+    kept = []
     if args.get("--all"):
-        targets = list(run["dispatches"])
+        targets = list(disp)
     elif args.get("--losers"):
-        targets = [d for d, r in run["dispatches"].items() if not r.get("adopted")]
+        targets = _loser_ids(run)
+        kept = [{"dispatch": did, "name": d["name"],
+                 "role": d.get("role"), "cluster": _cluster_of(run, d),
+                 "reason": "not a decided loser "
+                           "(use --cluster <c> or an explicit dispatch id)"}
+                for did, d in disp.items()
+                if did not in targets and not d.get("adopted")
+                and d.get("status") != "released"]
+    elif args.get("--cluster"):
+        cl = args["--cluster"]
+        targets = [did for did, d in disp.items()
+                   if not d.get("adopted") and _cluster_of(run, d) == cl]
+        kept = [{"dispatch": did, "name": d["name"], "reason": "adopted"}
+                for did, d in disp.items()
+                if d.get("adopted") and _cluster_of(run, d) == cl]
     else:
-        targets = [d for d in args["_"] ]
+        targets = [d for d in args["_"]]
         if args.get("--dispatch"):
             targets.append(args["--dispatch"])
-    if not targets:
-        die("usage: orch clean <dispatch>... | --losers | --all")
+    if not targets and not kept:
+        die("usage: orch clean <dispatch>... | --losers | --cluster <c> | --all")
     done = []
     for did in targets:
-        d = run["dispatches"].get(did)
-        if not d:
+        d = disp.get(did)
+        if not d or d.get("status") == "released":
             continue
         orca("orchestration", "worker-release", "--dispatch", did, check=False)
         if d.get("worktree"):
@@ -549,7 +597,7 @@ def cmd_clean(args):
         d["status"] = "released"
         done.append(did)
     state_save(st)
-    print(json.dumps({"released": done}))
+    print(json.dumps({"released": done, "kept": kept}, ensure_ascii=False))
 
 
 def cmd_status(args):
@@ -562,7 +610,8 @@ def cmd_status(args):
         "tasks": find_key(tasks, "tasks", tasks),
         "dispatches": [
             {"dispatch": k, "name": v["name"], "model": v["model"],
-             "status": v["status"], "adopted": v["adopted"],
+             "role": v.get("role"), "status": v["status"],
+             "adopted": v["adopted"],
              "branch": v.get("branch"), "age_min": int((time.time() - v["spawned_at"]) / 60)}
             for k, v in run["dispatches"].items()],
     }, indent=1, ensure_ascii=False))

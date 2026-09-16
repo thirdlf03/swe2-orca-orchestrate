@@ -44,6 +44,7 @@ Orca の思想に合わせ、**スケジューラは作らない**。Run は名�
 | heartbeat/ask 未使用(実測 hb計28回/ask 0) | 仕様テンプレに義務として全文埋め込み(プリアンブルは守られない実績) | tasks/template.md |
 | 統合が最遅ワーカー待ち | playbook の「採否確定→即integrate」。クラスタ単位でパイプライン | playbooks/coordinator.md |
 | 不採用残骸(170ファイル/3.1万行) | `orch clean --losers` で dispatch解放+worktree+端末を一括削除 | bin/orch |
+| `clean --losers` が spawn 直後の生きた integrator を kill(実測) | loser を「同クラスタに採用済み兄弟を持つ未adopt候補」と再定義。integrator/reviewer/採否未確定・再投入候補はマッチせず kept として報告。クラスタ放棄は `--cluster` | bin/orch |
 | medium が曖昧仕様を確認せず実装 | モデル配分表: 曖昧性高い仕事は medium に出さない + テンプレの「迷ったらask必須」 | tasks/template.md, playbook |
 
 ## 使い方
@@ -58,7 +59,8 @@ orch patrol [--rescue]             # 停止検出・救出
 orch collect                       # 完了候補の branch/worktree 一覧
 orch adopt --dispatch <id>
 orch integrate --topic ui --branches b1,b2 --verify "npx tsc --noEmit"
-orch clean --losers                # 不採用を一括削除
+orch clean --losers                # 採否確定クラスタの敗者のみ削除(後続dispatchは巻き込まない)
+orch clean --cluster <name>        # クラスタごと放棄(adoptedは残る)
 orch status
 ```
 
@@ -85,4 +87,7 @@ max を配分できるようになる(ORCH_ALLOW 無しでの max 指定は orch
 - sleep で完了を待たない — `orch wait` / `wait-for '<条件>'` を使う
 - 候補worktreeを直接編集しない(読むのは可)。本番への書き込みは integrator 経由
 - 採否確定後に不採用worktreeを放置しない — `orch clean` を機械的に回す
+  (`--losers` は決着済みクラスタの敗者だけを選ぶので、integrate 直後に
+  回しても生きた integrator は殺さない。安全側に倒した設計なので
+  「消えない残骸」があれば kept 出力を見て --cluster か個別指定を使う)
 - sessions.db / トランスクリプトの中身をrepoにコミットしない(個人情報の塊)

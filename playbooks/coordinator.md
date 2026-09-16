@@ -79,9 +79,14 @@ orch patrol --rescue                  # 承認メニューを検出したら自�
 orch adopt --dispatch <採用dispatch>
 orch integrate --topic <cluster> --branches <採用branch,...> \
   --verify "npx tsc --noEmit && npx vitest run"
-orch clean --losers          # 不採用の dispatch/worktree/端末を一括削除
+orch clean --losers          # 決着済みクラスタの敗者 dispatch/worktree/端末を一括削除
 ```
 
+- `--losers` は「同クラスタに採用済みがいる未adopt候補」だけを消す。
+  生きた integrator/reviewer・採否未確定の候補・採否後に再投入した候補は
+  対象外で `kept` として報告される → integrate 直後に回しても安全
+- クラスタごと放棄(全滅・やり直し)は `orch clean --cluster <name>`
+  (adopted は残る)。`kept` に残ったものを消すなら個別 dispatch 指定
 - クラスタ単位で「採否確定→即integrate→即clean losers」。全クラスタを待たない
 - インテグレーターは `integ/<topic>` ブランチにコミット。main には触らせない
 
