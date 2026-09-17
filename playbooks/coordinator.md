@@ -96,12 +96,16 @@ orch patrol --rescue                  # 承認メニューを検出したら自�
 - patrol が `zombie?` を報告したら spawn 失敗の残骸 —
   prompt injection が無言で失敗して devin が起動していない実測がある。
   `orch clean --dispatch <id>` で掃除して再投入する
+- `TYPESAFE_API_KEY` がある環境では `patrol --jev` が画面内容の意味判定も
+  行う(`jev-stuck:p=`)。ヒューリスティックの誤検知を減らせる
 - heartbeat が一定時間無い/端末が沈黙 → patrol で `terminal read` して状態確認
 - 15〜60分の無言は正常(コーディングタスクの常態)。timeout≠失敗
 
 ## 5. 審査(実物判定)
 
 - 候補の worktree パスは `orch collect` で一覧。ファイルは直接読める
+- **候補が多い時は `orch score`(要 TYPESAFE_API_KEY)で事前採点**して
+  上位2〜3だけ実物審査する。スコアは advisory — 採否は必ずあなたが決める
 - 「どれが良いか」は demo・スクショ・コード・report.md で**あなたが見て**決める
 - 報告の自己評価を鵜呑みにしない
 - 候補の個別ブランチを深く監査しない(レビューは統合後の1点に絞る)
@@ -110,7 +114,7 @@ orch patrol --rescue                  # 承認メニューを検出したら自�
 
 ```bash
 orch collect                     # dirty=N が未コミット数。0 以外は採用前に確認
-orch adopt --dispatch <採用dispatch>   # 未コミットがあれば warning が出る
+orch adopt --dispatch <採用dispatch> [--jev]  # 未コミット/完了妥当性の warning が出る
 orch integrate --topic <cluster> --branches <採用branch,...> \
   --verify "npx tsc --noEmit && npx vitest run"
 orch clean --losers          # 決着済みクラスタの敗者 dispatch/worktree/端末を一括削除
