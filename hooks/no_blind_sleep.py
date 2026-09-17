@@ -15,6 +15,13 @@ Policy:
     fixed list, so without an early exit it is a blind poll that runs all N
     iterations regardless of when the awaited event arrives
   - short sleeps (< 15) alongside a real command           -> ALLOW
+  - `sleep N` appearing as DATA, not code, is ignored:
+    heredoc bodies feeding non-interpreters (`cat <<EOF`, `--body "$(cat
+    <<EOF)"`) and quoted string literals (`echo '{"cmd":"sleep 60"}'`,
+    `printf '... sleep 20 ...'`) are not scanned. Quotes that feed an
+    interpreter (`bash -c '...'`, `ssh host '...'`, `eval '...'`, or a
+    segment piped into a shell) still count — a quoted blind wait is
+    still a blind wait.
 
 On block, prints a JSON decision + reason on stdout and the reason on
 stderr, then exits 2 (covers both JSON-decision and exit-code semantics).
@@ -55,6 +62,75 @@ or inside a `for` loop that can early-exit via break/exit/return."""
 PY_LOOP = re.compile(r"(?m)^\s*(while|for)\b")
 PY_BREAK = re.compile(r"\b(?:break|exit|return|sys\.exit)\b")
 
+HEREDOC_RE = re.compile(r"<<-?\s*['\"]?(\w+)['\"]?")
+# heredoc feeding these commands contains CODE (keep scanning its body);
+# anything else (cat, printf, tee, command-substitution payloads...) is data
+HEREDOC_CODE_RE = re.compile(
+    r"(?:^|[;&|({]\s*|&&|\|\|)\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*"
+    r"(?:sudo\s+|command\s+)?(?:python3?|bash|sh|zsh|dash|fish|perl|ruby|"
+    r"node|osascript|ssh|scp)\b"
+)
+# a quoted `sleep` still counts when the quote is CODE for an interpreter,
+# or when the segment pipes into one (`echo 'sleep 9' | sh`)
+EXEC_RE = re.compile(
+    r"\b(?:ba?sh|zsh|fish|dash|ksh)\s+-[a-zA-Z]*c\b|\beval\b|\bssh\b"
+    r"|\bpython3?\s+-c\b|\bperl\s+-e\b|\bruby\s+-e\b|\bnode\s+-e\b"
+    r"|\bosascript\b|\btmux\s+send|\bsudo\s+(?:ba?sh|sh)\b"
+    # quote piped into an interpreter (`echo 'sleep 9' | sh`) still runs it
+    r"|\|\s*(?:sudo\s+)?(?:ba?sh|zsh|fish|dash|ksh|sh|eval|python3?|perl|ruby|node)\b"
+)
+
+
+def strip_heredocs(cmd: str) -> str:
+    """Drop heredoc bodies that feed non-interpreters (file content, PR
+    bodies, JSON fixtures). Heredocs piped to python/bash/ssh keep their
+    body — `python3 - <<EOF` is code, `cat <<EOF` is data."""
+    out, skip = [], None
+    for ln in cmd.split("\n"):
+        if skip is not None:
+            if ln.strip() == skip:
+                skip = None
+            continue
+        out.append(ln)
+        m = HEREDOC_RE.search(ln)
+        if m and not HEREDOC_CODE_RE.search(ln[: m.start()]):
+            skip = m.group(1)
+    return "\n".join(out)
+
+
+def in_data_literal(cmd: str, pos: int) -> bool:
+    """True if `pos` sits inside a quoted string that is DATA (echo/printf
+    payload, JSON arg, ...) rather than code handed to an interpreter."""
+    i, n, q, seg_start, q_start = 0, len(cmd), None, 0, None
+    while i < n:
+        ch = cmd[i]
+        if q:
+            if ch == "\\" and i + 1 < n:
+                i += 1
+            elif ch == q:
+                if q_start is not None and q_start < pos < i:
+                    seg = cmd[seg_start : i + 1]
+                    m = re.match(r"\s*\|\s*([^;|&\n]*)", cmd[i + 1 :], re.S)
+                    if m:
+                        seg += " | " + m.group(1)
+                    return not EXEC_RE.search(seg)
+                q, q_start = None, None
+        else:
+            if ch in "\"'":
+                q, q_start = ch, i
+            elif ch in ";\n":
+                seg_start = i + 1
+            elif ch == "&":
+                if cmd[i : i + 2] == "&&":
+                    seg_start = i + 2
+                    i += 1
+            elif ch == "|":
+                seg_start = i + 2 if cmd[i : i + 2] == "||" else i + 1
+                if cmd[i : i + 2] == "||":
+                    i += 1
+        i += 1
+    return False
+
 
 def in_condition_loop(cmd: str, pos: int, shell: bool = True) -> bool:
     before = cmd[:pos]
@@ -89,6 +165,7 @@ def main() -> None:
     cmd = ti.get("command") or ti.get("text_input") or ti.get("bytes_input") or ""
     if not cmd:
         return
+    cmd = strip_heredocs(cmd)
 
     bad = []
     matches = [
@@ -98,6 +175,8 @@ def main() -> None:
         (m.start(), float(m.group(1)), False) for m in PY_SLEEP_RE.finditer(cmd)
     ]
     for pos, n, shell in matches:
+        if in_data_literal(cmd, pos):
+            continue
         if in_condition_loop(cmd, pos, shell):
             continue
         if n >= MIN_BLOCK_S:

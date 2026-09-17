@@ -6,9 +6,21 @@ failure-mode fixes so a coordinator agent (human-driven or swe-2) never
 re-derives them:
 
   spawn    worker = new worktree + `devin --model X --permission-mode bypass`
-           terminal + supervised dispatch (worker-start --terminal)
+           terminal + supervised dispatch (worker-start --terminal).
+           Any failure after worktree create rolls the worktree/branch/
+           terminal back — no stale wreckage from `worker-start failed`
+  batch    serial spawn loop from a JSON manifest (task→name/model map is
+           DATA, not a shell `declare -A`). Paced spawns + per-item retry;
+           one bad item doesn't kill the batch
   wait     event-driven `check --wait --types ...` + ack chaining
            (never sleep-polls; heartbeats can't spuriously wake it)
+  score    Jev (TypeSafe System One) pre-screen: score each candidate
+           against its spec so the coordinator reviews the top few,
+           not every worktree. Requires TYPESAFE_API_KEY
+  --jev    flag on spawn/compete/batch/patrol/adopt adds cheap semantic
+           checks (spec-ambiguity gate, stuck-terminal detection,
+           done-claim sanity) — advisory except the medium-on-ambiguous
+           spec block
   patrol   sweeps live dispatches: permission-menu stalls, silent workers
   collect  settle report: dispatch -> outcome / branch / worktree
   adopt    record which candidate won a competition
@@ -32,6 +44,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.request
 
 ORCA = os.environ.get("ORCA_CLI_COMMAND", "orca")
 DEVIN = os.environ.get("ORCH_DEVIN_CMD", "devin")
@@ -232,53 +245,77 @@ def _send_prompt_devin(handle, prompt, retries=3):
     return False
 
 
+def _spawn_rollback(wid, handle, branch):
+    """Undo a half-spawn: close the terminal, force-rm the worktree, delete
+    the branch. Measured incident: `worker-start failed` left one stale
+    worktree+branch per attempt (17 worktrees / 62 branches accumulated in
+    one run). Rollback is best-effort — every step is check=False."""
+    if handle:
+        orca("terminal", "close", "--terminal", handle, check=False)
+    if wid:
+        orca("worktree", "rm", "--worktree", f"id:{wid}", "--force",
+             check=False)
+    if branch:
+        subprocess.run(["git", "branch", "-D", branch], capture_output=True)
+
+
 def _spawn_one(run, tid, name, model, base, setup, repo, st, role="worker"):
-    """worktree -> devin terminal (bypass!) -> worker-start --terminal."""
+    """worktree -> devin terminal (bypass!) -> worker-start --terminal.
+    Any failure after the worktree exists rolls all created resources back."""
     model = _canonical_model(model)
-    _check_model_allowed(model)
-    wargs = ["worktree", "create", "--name", name]
-    if base:
-        wargs += ["--base-branch", base]
-    if repo:
-        wargs += ["--repo", repo]
-    if setup:
-        wargs += ["--setup", setup]
-    w = orca(*wargs)
-    wid = find_key(w, "id")
-    branch = find_key(w, "branch") or ""
-    branch = re.sub(r"^refs/heads/", "", branch)
-    wpath = find_key(w, "path")
-    if not wid:
-        die(f"worktree create: no id in {json.dumps(w)[:400]}")
+    _check_model_allowed(model, st)
+    wid = branch = handle = None
+    try:
+        wargs = ["worktree", "create", "--name", name]
+        if base:
+            wargs += ["--base-branch", base]
+        if repo:
+            wargs += ["--repo", repo]
+        if setup:
+            wargs += ["--setup", setup]
+        w = orca(*wargs)
+        wid = find_key(w, "id")
+        branch = find_key(w, "branch") or ""
+        branch = re.sub(r"^refs/heads/", "", branch)
+        wpath = find_key(w, "path")
+        if not wid:
+            die(f"worktree create: no id in {json.dumps(w)[:400]}")
 
-    cmd = f"{DEVIN} --model {model} --permission-mode bypass"
-    t = orca("terminal", "create", "--worktree", f"id:{wid}",
-             "--title", name, "--command", cmd)
-    handle = find_key(t, "handle")
-    if not handle:
-        die(f"terminal create: no handle in {json.dumps(t)[:400]}")
-    _wait_devin_ready(handle)
+        cmd = f"{DEVIN} --model {model} --permission-mode bypass"
+        t = orca("terminal", "create", "--worktree", f"id:{wid}",
+                 "--title", name, "--command", cmd)
+        handle = find_key(t, "handle")
+        if not handle:
+            die(f"terminal create: no handle in {json.dumps(t)[:400]}")
+        _wait_devin_ready(handle)
 
-    ws = orca("orchestration", "worker-start", "--task", tid,
-              "--terminal", handle, "--worktree", f"id:{wid}", check=False)
-    # devin is not a known-agent: if the prompt landed but stalled at the
-    # input box ([Pasted text ...] unsubmitted), press Enter once to submit.
-    if not ws or find_key(ws, "lastError") == "agent_prompt_stalled" \
-            or find_key(ws, "state") == "failed":
-        _submit_pending_paste(handle)
         ws = orca("orchestration", "worker-start", "--task", tid,
                   "--terminal", handle, "--worktree", f"id:{wid}", check=False)
-    if not ws or find_key(ws, "state") == "failed":
-        die(f"worker-start failed: {json.dumps(ws)[:600]}")
-    did = find_key(ws, "dispatchId") or find_key(ws, "dispatch") or find_key(ws, "id")
-    rec = {"dispatch": did, "task": tid, "name": name, "model": model,
-           "role": role, "worktree": wid, "path": wpath, "branch": branch,
-           "terminal": handle, "spawned_at": int(time.time()),
-           "status": "active", "adopted": False}
-    run["dispatches"][did] = rec
-    run["tasks"].setdefault(tid, {}).setdefault("dispatches", []).append(did)
-    state_save(st)
-    return rec
+        # devin is not a known-agent: if the prompt landed but stalled at the
+        # input box ([Pasted text ...] unsubmitted), press Enter once to submit.
+        if not ws or find_key(ws, "lastError") == "agent_prompt_stalled" \
+                or find_key(ws, "state") == "failed":
+            _submit_pending_paste(handle)
+            ws = orca("orchestration", "worker-start", "--task", tid,
+                      "--terminal", handle, "--worktree", f"id:{wid}",
+                      check=False)
+        if not ws or find_key(ws, "state") == "failed":
+            die("worker-start failed: "
+                f"{json.dumps(ws)[:600]}\nscreen tail: "
+                f"{_screen_tail(handle, 10)[:400]}")
+        did = (find_key(ws, "dispatchId") or find_key(ws, "dispatch")
+               or find_key(ws, "id"))
+        rec = {"dispatch": did, "task": tid, "name": name, "model": model,
+               "role": role, "worktree": wid, "path": wpath, "branch": branch,
+               "terminal": handle, "spawned_at": int(time.time()),
+               "status": "active", "adopted": False}
+        run["dispatches"][did] = rec
+        run["tasks"].setdefault(tid, {}).setdefault("dispatches", []).append(did)
+        state_save(st)
+        return rec
+    except BaseException:
+        _spawn_rollback(wid, handle, branch)
+        raise
 
 
 # uids whose tier is Max (`devin models list`, 2026-09). Note swe-1-7 and
@@ -293,11 +330,17 @@ def _canonical_model(model):
             "max": "swe-2-max"}.get(model.strip().lower(), model.strip())
 
 
-def _check_model_allowed(model):
-    """Max-tier models are gated on ORCH_ALLOW (set by `orch boot --allow
-    swe-2-max`). Coordinators run orch inside the booted terminal, so the env
-    var is the mechanical allowlist — a coordinator ignoring the playbook
-    still dies here.
+def _check_model_allowed(model, st=None):
+    """Max-tier models are gated on ORCH_ALLOW (`orch boot --allow swe-2-max`).
+    The gate consults TWO sources, either suffices:
+
+      1. env ORCH_ALLOW=swe-2-max — set by boot in the coordinator terminal
+      2. run["allow"] persisted in .orch/state.json by `orch boot --allow`
+
+    (2) exists because a measured incident had ORCH_ALLOW lost inside a
+    coordinator-spawned BACKGROUND shell — env vars don't propagate to
+    shells the coordinator starts later, so max-worker spawns were
+    mysteriously rejected mid-run.
 
     devin's --model accepts fuzzy names (alias or partial), so we can't just
     compare == 'swe-2-max': 'max', 'swe-2-ma', or a bare family slug like
@@ -305,10 +348,174 @@ def _check_model_allowed(model):
     containing 'max' plus any prefix of a known max-tier uid — an ambiguous
     prefix like 'swe-2-m' dies too; use explicit variant names."""
     m = model.strip().lower()
-    if ("max" in m or any(u.startswith(m) for u in MAX_TIER_UIDS)) \
-            and os.environ.get("ORCH_ALLOW") != "swe-2-max":
-        die(f"model '{model}' is max-tier: requires "
-            "`orch boot --allow swe-2-max` (ORCH_ALLOW unset)")
+    if "max" not in m and not any(u.startswith(m) for u in MAX_TIER_UIDS):
+        return
+    if os.environ.get("ORCH_ALLOW") == "swe-2-max":
+        return
+    if st is None:
+        st = state_load()
+    run = (st.get("runs") or {}).get(st.get("current_run") or "", {})
+    if run.get("allow") == "swe-2-max":
+        return
+    die(f"model '{model}' is max-tier: requires "
+        "`orch boot --allow swe-2-max` (no ORCH_ALLOW env and no persisted "
+        "allow in .orch/state.json)")
+
+
+# ---------- Jev (TypeSafe System One) — opt-in semantic judgments ----------
+#
+# orch's structure is bimodal: deterministic checks (verify commands, dirty
+# count) vs expensive coordinator judgment (reading every worktree). Jev
+# fills the empty middle: typed probabilistic decisions at ~100-500ms and
+# ~$0.042/1M input tokens. It never writes text and never decides adoption —
+# it pre-screens, so the coordinator reviews the top few candidates instead
+# of all of them (measured: 328 `orca eval` + 112 screenshots in one run).
+#
+# Two gates, both required: the --jev flag AND $TYPESAFE_API_KEY. Every Jev
+# failure degrades to the non-Jev path — an early-access API must never be
+# able to break a run. The ONE exception is the medium-on-ambiguous-spec
+# block, which is mechanical enforcement (measured failure: medium proceeds
+# on ambiguous specs without asking).
+
+JEV_ENDPOINT = os.environ.get(
+    "ORCH_JEV_ENDPOINT", "https://api.typesafe.ai/v1/systemone")
+JEV_MODEL = "jev-latest"
+JEV_AMBIGUITY_BLOCK = 0.7   # P(ambiguous) >= this + swe-2-medium -> die
+JEV_AMBIGUITY_WARN = 0.4    # P(ambiguous) >= this -> stderr warning
+
+
+def _jev_enabled(args, st=None):
+    """Opt-in paths (any suffices), ALL requiring TYPESAFE_API_KEY:
+      1. --jev flag on the command
+      2. ORCH_JEV env — set in the coordinator terminal by `boot --jev`
+      3. run["jev"] persisted by `orch boot --jev` — the durable path,
+         since env vars don't reach coordinator-spawned background shells
+         (same lesson as ORCH_ALLOW)
+    Opt-in without a key warns once and proceeds without Jev rather than
+    dying — Jev is advisory and must never break a run."""
+    want = bool(args.get("--jev") or os.environ.get("ORCH_JEV"))
+    if not want:
+        if st is None:
+            st = state_load()
+        run = (st.get("runs") or {}).get(st.get("current_run") or "", {})
+        want = bool(run.get("jev"))
+    if not want:
+        return False
+    if not os.environ.get("TYPESAFE_API_KEY"):
+        print("orch: Jev is enabled for this run but TYPESAFE_API_KEY is "
+              "not in the environment; continuing without Jev",
+              file=sys.stderr)
+        return False
+    return True
+
+
+def _jev_ask(state, questions, timeout=30):
+    """POST state+typed questions to Jev; return the answers dict.
+    Returns None on ANY failure (network/HTTP/parse) — callers degrade."""
+    key = os.environ.get("TYPESAFE_API_KEY")
+    if not key:
+        return None
+    body = json.dumps({"model": JEV_MODEL, "state": state,
+                       "questions": questions}).encode()
+    req = urllib.request.Request(
+        JEV_ENDPOINT, data=body, method="POST",
+        headers={"Authorization": f"Bearer {key}",
+                 "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            doc = json.loads(r.read().decode())
+        return doc.get("answers") or {}
+    except Exception as e:
+        print(f"orch: jev call failed (continuing without it): {e}",
+              file=sys.stderr)
+        return None
+
+
+def _task_spec_text(run, tid):
+    """Spec text recorded at task-create time, if the file still exists."""
+    t = (run.get("tasks") or {}).get(tid) or {}
+    sf = t.get("spec_file")
+    if sf and os.path.isfile(sf):
+        try:
+            return open(sf).read()
+        except OSError:
+            return None
+    return None
+
+
+def _jev_spec_ambiguity(spec_text, args, st=None):
+    """P(spec is unsafe for an autonomous worker) per Jev, or None when
+    Jev is off / the call fails / there's no spec text to judge.
+
+    Ambiguity has TWO failure modes (real-API calibration: a nearly empty
+    spec scored low on "divergent readings" because it offers zero
+    interpretations, while a spec with one undecided rule scored high) —
+    so we decompose per the System One docs and take the max:
+      vague     — not enough detail to start without guessing
+      divergent — two reasonable readings yield different deliverables
+    """
+    if not _jev_enabled(args, st) or not spec_text:
+        return None
+    answers = _jev_ask(
+        "Task spec handed to an autonomous coding worker:\n\n"
+        + spec_text[:6000],
+        {"vague": {
+            "type": "noul",
+            "instructions": "This spec lacks enough detail for a worker to "
+                            "start without guessing at the goal, the "
+                            "deliverable, or how success is judged"},
+         "divergent": {
+            "type": "noul",
+            "instructions": "Two competent workers could build materially "
+                            "DIFFERENT deliverables from this spec because "
+                            "a decision that changes the outcome is left "
+                            "unspecified — not merely missing minor details "
+                            "a worker can reasonably default"}})
+    if not answers:
+        return None
+    ps = [float(a["noul"]) for a in answers.values()
+          if a.get("noul") is not None]
+    return max(ps) if ps else None
+
+
+def _spec_gate_apply(p, models):
+    """Block swe-2-medium on ambiguous specs (measured failure: medium
+    proceeds without asking, producing discarded work). Other tiers warn
+    only — high/max demonstrably flag spec bugs themselves."""
+    if p is None:
+        return
+    models = [_canonical_model(m) for m in models]
+    if any("medium" in m for m in models) and p >= JEV_AMBIGUITY_BLOCK:
+        die(f"Jev scores this spec ambiguous (p={p:.2f}) — medium proceeds "
+            "without asking on ambiguous specs (measured). Clarify the spec "
+            "or use a higher model tier")
+    if p >= JEV_AMBIGUITY_WARN:
+        print(f"orch: jev spec-ambiguity p={p:.2f}; consider clarifying",
+              file=sys.stderr)
+
+
+def _dispatch_state_text(d, run):
+    """Bounded state for Jev: spec excerpt + worker meta + dirty count +
+    report.md + worker-show. Jev judges MEANING, so include the artifacts'
+    text — not just ids."""
+    parts = [f"Worker: {d.get('name')} model={d.get('model')} "
+             f"role={d.get('role')} branch={d.get('branch')}"]
+    spec = _task_spec_text(run, d.get("task"))
+    if spec:
+        parts.append("TASK SPEC:\n" + spec[:3000])
+    dirty = _git_dirty(d.get("path"))
+    parts.append(f"Uncommitted paths in worktree: {len(dirty)}")
+    rp = os.path.join(d.get("path") or "", "report.md")
+    if os.path.isfile(rp):
+        try:
+            parts.append("worker report.md:\n" + open(rp).read()[:4000])
+        except OSError:
+            pass
+    ws = orca("orchestration", "worker-show", "--dispatch", d["dispatch"],
+              check=False)
+    if ws:
+        parts.append("worker status: " + json.dumps(ws)[:1500])
+    return "\n\n".join(parts)
 
 
 def cmd_spawn(args):
@@ -318,7 +525,9 @@ def cmd_spawn(args):
     st = state_load()
     _, run = cur_run(st)
     model = args.get("--model") or "swe-2-medium"
-    _check_model_allowed(model)
+    _check_model_allowed(model, st)
+    _spec_gate_apply(
+        _jev_spec_ambiguity(_task_spec_text(run, task), args, st), [model])
     rec = _spawn_one(run, task, args.get("--name") or f"w-{task[-6:]}",
                      model,
                      args.get("--base"), args.get("--setup") or "run",
@@ -336,12 +545,13 @@ def cmd_compete(args):
     models = [m.strip() for m in (args.get("--models") or "").split(",") if m.strip()]
     default_models = ["swe-2-high"] + ["swe-2-medium"] * (n - 1)
     models = (models + default_models)[:n]
-    for m in models:
-        _check_model_allowed(m)
-    cluster = args.get("--cluster") or os.path.splitext(os.path.basename(spec_file))[0]
-    spec = open(spec_file).read()
     st = state_load()
     rid, run = cur_run(st)
+    for m in models:
+        _check_model_allowed(m, st)
+    spec = open(spec_file).read()
+    _spec_gate_apply(_jev_spec_ambiguity(spec, args, st), models)
+    cluster = args.get("--cluster") or os.path.splitext(os.path.basename(spec_file))[0]
     recs = []
     for i in range(n):
         title = f"{cluster}-{i+1}"
@@ -355,6 +565,103 @@ def cmd_compete(args):
                          args.get("--repo"), st, role="candidate")
         recs.append(rec)
     print(json.dumps(recs, indent=1))
+
+
+def cmd_batch(args):
+    """Serial spawn loop driven by a JSON manifest — the mass-spawn path.
+
+    Measured incident: a coordinator hand-rolled a bash loop with
+    `declare -A` (absent on macOS bash 3.2) to map tasks→models; the map
+    silently broke, dispatching a WRONG spec to one worker and storming
+    `worker-start failed` on the rest (17 stale worktrees). Putting the
+    assignment in a JSON file makes the mapping auditable data, and
+    keeping the loop inside orch gives pacing/rollback/retry for free.
+
+    Manifest:
+      {"defaults": {"model": "swe-2-medium", "setup": "run", "base": null},
+       "items": [
+         {"spec_file": "tasks/w01.md", "title": "w01", "cluster": "works",
+          "name": "w01-x", "model": "swe-2-high"},
+         {"task": "task_abc", "name": "w-retry", "model": "swe-2-medium"}
+       ]}
+    Each item needs EITHER "task" (existing task id) OR "spec_file"
+    (creates a task first; title/cluster default from the file name).
+    """
+    files = args["_"]
+    if not files:
+        die("usage: orch batch <manifest.json> [--gap-sec N] [--retries N]")
+    man = json.loads(open(files[0]).read())
+    items = man.get("items") or []
+    if not items:
+        die("manifest has no items")
+    defaults = man.get("defaults") or {}
+    gap = float(args.get("--gap-sec") or 8)
+    retries = int(args.get("--retries") or 1)
+    st = state_load()
+    rid, run = cur_run(st)
+    for it in items:
+        _check_model_allowed(it.get("model") or defaults.get("model")
+                             or "swe-2-medium", st)
+
+    ok, failed = [], []
+    for i, it in enumerate(items):
+        if i:
+            time.sleep(gap)   # pacing: back-to-back spawns triggered
+                              # `worker-start failed: null` (rate limit?)
+        try:
+            tid = it.get("task")
+            spec = None
+            if not tid:
+                spec_file = it.get("spec_file")
+                if not spec_file:
+                    raise ValueError("item needs 'task' or 'spec_file'")
+                spec = open(spec_file).read()
+                title = (it.get("title")
+                         or os.path.splitext(os.path.basename(spec_file))[0])
+                r = orca("orchestration", "task-create", "--spec", spec,
+                         "--task-title", title, "--run", rid)
+                tid = find_key(r, "id") or find_key(r, "taskId")
+                run["tasks"][tid] = {
+                    "title": title, "spec_file": spec_file,
+                    "cluster": it.get("cluster") or man.get("cluster"),
+                    "deps": [], "dispatches": []}
+            name = it.get("name") or f"w-{tid[-6:]}"
+            model = (it.get("model") or defaults.get("model")
+                     or "swe-2-medium")
+            _spec_gate_apply(
+                _jev_spec_ambiguity(
+                    spec if spec is not None
+                    else _task_spec_text(run, tid), args, st),
+                [model])
+            rec = None
+            err = None
+            for attempt in range(retries + 1):
+                try:
+                    rec = _spawn_one(
+                        run, tid, name, model,
+                        it.get("base") or defaults.get("base"),
+                        it.get("setup") or defaults.get("setup") or "run",
+                        it.get("repo") or defaults.get("repo"), st,
+                        role=it.get("role") or "worker")
+                    break
+                except SystemExit as e:
+                    err = e
+                    if attempt < retries:
+                        time.sleep(max(gap, 15))
+            if rec:
+                ok.append({"name": name, "dispatch": rec["dispatch"]})
+            else:
+                failed.append({"name": name, "error": str(err)})
+                print(f"orch: spawn failed for {name}: {err}",
+                      file=sys.stderr)
+        except Exception as e:
+            failed.append({"name": it.get("name") or "?", "error": str(e)})
+            print(f"orch: item failed: {e}", file=sys.stderr)
+    state_save(st)
+    print(json.dumps({"spawned": ok, "failed": failed},
+                     indent=1, ensure_ascii=False))
+    if failed:
+        sys.exit(2)
 
 
 WAIT_TYPES = "worker_done,escalation,question"
@@ -422,9 +729,16 @@ def _permission_menu_key(text):
     return None
 
 
+# worker-show states meaning "accepted but not yet executing" — a dispatch
+# stuck here past --stale-min is a zombie, not a slow worker
+NEVER_STARTED_STATES = {"dispatched", "pending", "created", "starting",
+                        "accepted", "queued"}
+
+
 def cmd_patrol(args):
     st = state_load()
     _, run = cur_run(st)
+    jev = _jev_enabled(args, st)
     stale_s = float(args.get("--stale-min") or 12) * 60
     now = time.time()
     report = []
@@ -449,12 +763,47 @@ def cmd_patrol(args):
                 orca("terminal", "send", "--terminal", d["terminal"],
                      "--enter", check=False)
                 entry["issues"].append(f"rescued:key={key}")
+        if jev and tail:
+            # semantic stuck-detection: the heuristic checks above only see
+            # state names + elapsed time; Jev reads the screen for meaning
+            a = _jev_ask(
+                "Screen tail of a supervised autonomous worker terminal:\n\n"
+                + tail,
+                {"stuck": {
+                    "type": "noul",
+                    "instructions": "The worker is stopped or idle — waiting "
+                                    "on a prompt, an unanswered question, an "
+                                    "error state, or sitting at a fresh "
+                                    "prompt with no task in progress"}})
+            sp = ((a or {}).get("stuck") or {}).get("noul")
+            if sp is not None and float(sp) >= 0.6:
+                entry["issues"].append(f"jev-stuck:p={float(sp):.2f}")
         idle = now - d.get("spawned_at", now)
-        if idle > stale_s and wstate in ("ready", "running", "active", "?"):
-            # no heartbeat tracking in state file; flag long-running actives for eyeball
-            entry["issues"].append(f"running>{int(idle/60)}m")
+        if idle > stale_s:
+            if wstate in ("ready", "running", "active", "?"):
+                # no heartbeat tracking in state file; flag long-running
+                # actives for eyeball
+                entry["issues"].append(f"running>{int(idle/60)}m")
+            elif wstate in NEVER_STARTED_STATES:
+                # measured incident: a dispatch whose devin session never
+                # started (prompt injection silently failed) sat for hours
+                # looking identical to a live worker in `orch status`
+                entry["issues"].append(
+                    f"zombie? state={wstate} for {int(idle/60)}m "
+                    "(spawned but never started — likely a failed prompt "
+                    "injection; clean + respawn)")
         report.append(entry)
     print(json.dumps(report, indent=1, ensure_ascii=False))
+
+
+def _git_dirty(path):
+    """Uncommitted paths in a worktree (worker commit-forgetfulness is a
+    measured failure — `orch adopt` used to silently adopt empty branches)."""
+    if not path or not os.path.isdir(path):
+        return []
+    p = subprocess.run(["git", "-C", path, "status", "--porcelain"],
+                       capture_output=True, text=True)
+    return [ln for ln in p.stdout.splitlines() if ln.strip()]
 
 
 def cmd_collect(args):
@@ -469,6 +818,7 @@ def cmd_collect(args):
             "status": find_key(ws, "status") or find_key(ws, "state") or d["status"],
             "outcome": find_key(ws, "outcome"),
             "adopted": d.get("adopted", False),
+            "dirty": len(_git_dirty(d.get("path"))),
         })
     print(json.dumps(rows, indent=1, ensure_ascii=False))
 
@@ -481,11 +831,104 @@ def cmd_adopt(args):
     _, run = cur_run(st)
     if did not in run["dispatches"]:
         die(f"unknown dispatch {did}")
-    run["dispatches"][did]["adopted"] = True
-    run["dispatches"][did]["adopted_at"] = int(time.time())
+    d = run["dispatches"][did]
+    dirty = _git_dirty(d.get("path"))
+    warnings = []
+    if _jev_enabled(args, st):
+        # done-claim sanity: measured failures had worker_done fire with
+        # artifacts uncommitted / verification skipped. Advisory — adoption
+        # stays the coordinator's judgment.
+        a = _jev_ask(
+            _dispatch_state_text(d, run),
+            {"completed": {
+                "type": "noul",
+                "instructions": "The evidence indicates the worker actually "
+                                "completed the task spec — artifacts exist "
+                                "and verification ran — not merely claimed "
+                                "completion"}})
+        cp = ((a or {}).get("completed") or {}).get("noul")
+        if cp is not None:
+            jev_p = round(float(cp), 3)
+            if jev_p < 0.5:
+                warnings.append(
+                    f"Jev doubts completion (p={jev_p:.2f}) — inspect the "
+                    "worktree before integrating")
+        else:
+            jev_p = None
+    else:
+        jev_p = None
+    d["adopted"] = True
+    d["adopted_at"] = int(time.time())
     state_save(st)
-    print(json.dumps({"adopted": did,
-                      "branch": run["dispatches"][did].get("branch")}))
+    out = {"adopted": did, "branch": d.get("branch")}
+    if jev_p is not None:
+        out["jev_completed_p"] = jev_p
+    if dirty:
+        # warn, don't block: the coordinator may adopt intentionally, but a
+        # measured incident had worker_done fire with artifacts uncommitted
+        warnings.append(f"worktree has {len(dirty)} uncommitted paths — "
+                        "adopting merges only what's committed")
+        out["dirty_paths"] = dirty[:20]
+    if warnings:
+        out["warning"] = "; ".join(warnings)
+    print(json.dumps(out, ensure_ascii=False))
+
+
+def cmd_score(args):
+    """Jev pre-screen: rank candidates against their specs so the
+    coordinator reviews the top few worktrees instead of every one
+    (measured: 328 `orca eval` calls + 112 screenshots in a single run —
+    the coordinator inspected everything). Advisory only: this prints a
+    ranking; `orch adopt` stays the coordinator's decision.
+
+    The command itself is the opt-in — it requires TYPESAFE_API_KEY.
+    """
+    if not os.environ.get("TYPESAFE_API_KEY"):
+        die("orch score requires TYPESAFE_API_KEY in the environment")
+    st = state_load()
+    _, run = cur_run(st)
+    cluster = args.get("--cluster")
+    only = set((args.get("--dispatch") or "").split(",")) - {""}
+    rows = []
+    for did, d in run["dispatches"].items():
+        if d.get("status") == "released" or d.get("adopted"):
+            continue
+        if only and did not in only:
+            continue
+        if cluster:
+            t = (run.get("tasks") or {}).get(d.get("task")) or {}
+            if t.get("cluster") != cluster:
+                continue
+        a = _jev_ask(
+            _dispatch_state_text(d, run),
+            {"satisfies": {
+                "type": "noul",
+                "instructions": "Based on the report and status evidence, "
+                                "the worker delivered what the task spec "
+                                "requires"},
+             "quality": {
+                 "type": "score",
+                 "instructions": "Adoption-worthiness of this submission",
+                 "criteria": ["reject — broken, off-spec, or empty",
+                              "weak — partial or unverified",
+                              "solid — meets spec with verification",
+                              "strong — exceeds spec, clean evidence"]}})
+        a = a or {}
+        rows.append({
+            "dispatch": did, "name": d.get("name"),
+            "model": d.get("model"), "branch": d.get("branch"),
+            "dirty": len(_git_dirty(d.get("path"))),
+            "jev_satisfies_p": (a.get("satisfies") or {}).get("noul"),
+            "jev_quality": (a.get("quality") or {}).get("score"),
+            "jev_confidence": (a.get("quality") or {}).get("confidence"),
+            "jev_legend": (a.get("quality") or {}).get("legend"),
+        })
+    rows.sort(key=lambda r: (r.get("jev_quality") is not None,
+                             r.get("jev_quality") or 0), reverse=True)
+    print(json.dumps({"ranking": rows,
+                      "note": "advisory — review top candidates yourself; "
+                              "orch adopt stays your call"},
+                     indent=1, ensure_ascii=False))
 
 
 def cmd_integrate(args):
@@ -495,13 +938,13 @@ def cmd_integrate(args):
     if not topic or not branches:
         die("usage: orch integrate --topic <t> --branches b1,b2 [--model M] [--verify 'cmd']")
     integ_model = args.get("--model") or "swe-2-high"
-    _check_model_allowed(integ_model)
+    st = state_load()
+    _check_model_allowed(integ_model, st)
     tpl_path = os.path.join(HARNESS_DIR, "tasks", "integrator.template.md")
     tpl = open(tpl_path).read()
     spec = (tpl.replace("{{TOPIC}}", topic)
                .replace("{{BRANCHES}}", branches)
                .replace("{{VERIFY}}", args.get("--verify") or "(repo の検証コマンド)"))
-    st = state_load()
     rid, run = cur_run(st)
     r = orca("orchestration", "task-create", "--spec", spec,
              "--task-title", f"integ-{topic}", "--run", rid)
@@ -641,30 +1084,37 @@ def cmd_boot(args):
     """Spawn a coordinator devin terminal that runs playbooks/coordinator.md."""
     files = args["_"]
     if not files:
-        die("usage: orch boot <requirement-file> [--allow swe-2-max] [--worktree sel]")
+        die("usage: orch boot <requirement-file> [--allow swe-2-max] "
+            "[--jev] [--worktree sel]")
     if args.get("--model"):
         die("--model is gone: coordinator defaults to swe-2-high. "
             "Use --allow swe-2-max to run the coordinator and workers on max")
     allow = args.get("--allow")
     if allow and allow != "swe-2-max":
         die(f"unknown --allow value: {allow} (only swe-2-max is allow-able)")
+    jev = bool(args.get("--jev"))
     req = os.path.abspath(files[0])
     obj = open(req).read().strip().splitlines()[0][:200]
     r = orca("orchestration", "run-create", "--objective", obj)
     rid = find_key(r, "id") or find_key(r, "runId")
     st = state_load()
     st["runs"][rid] = {"objective": obj, "created_at": int(time.time()),
-                     "tasks": {}, "dispatches": {}}
+                     "tasks": {}, "dispatches": {}, "allow": allow,
+                     "jev": jev}
     st["current_run"] = rid
     state_save(st)
 
     # coordinator is swe-2-high by default; --allow swe-2-max upgrades the
-    # coordinator itself to max AND exports ORCH_ALLOW so workers can use it.
+    # coordinator itself to max AND lets workers use max. The allow is
+    # persisted in run state (above) so it survives background shells that
+    # lose ORCH_ALLOW — env vars don't reach shells the coordinator spawns
+    # later (measured incident: max spawns rejected mid-run).
     model = allow or "swe-2-high"
-    # Always set ORCH_ALLOW explicitly: `env ORCH_ALLOW=` (empty) clears a
-    # value leaked from the shell running `orch boot`, so --allow-less runs
-    # can't inherit max permission from the caller's environment.
-    cmd = (f"env ORCH_ALLOW={allow or ''} "
+    # Same for --jev: persisted in run state so every orch command in this
+    # run sees Jev as opted-in even without the flag. Both env vars are
+    # set explicitly — an empty value clears anything leaked from the
+    # shell that ran `orch boot`.
+    cmd = (f"env ORCH_ALLOW={allow or ''} ORCH_JEV={'1' if jev else ''} "
            f"{DEVIN} --model {model} --permission-mode bypass")
     wt = _resolve_worktree(args)
     t = orca("terminal", "create", "--worktree", wt, "--title", "coordinator",
@@ -677,11 +1127,12 @@ def cmd_boot(args):
         f"1. まず `orca orchestration run-use --id {rid}` でこの端末をRunにbindする\n"
         f"2. {playbook} を読み、要件ファイル {req} に対して実行する\n"
         f"3. ハーネスCLI: {HARNESS_DIR}/bin/orch (stateはこの端末のcwdの .orch/)\n"
-        f"4. モデル上限: {'swe-2-max まで使用可 (ORCH_ALLOW=swe-2-max が環境変数に設定済み)' if allow else 'swe-2-high まで。swe-2-max はこのRunでは禁止'}"
+        f"4. モデル上限: {'swe-2-max まで使用可 (allow は .orch/state.json に永続化済み・バックグラウンドシェルからでも有効)' if allow else 'swe-2-high まで。swe-2-max はこのRunでは禁止'}\n"
+        f"5. Jev: {'このRunは --jev 有効。`orch score` で候補を事前採点して上位だけ実物審査し、spawn/compete/batch/patrol/adopt の Jev 判定は state 永続化により自動で効く(TYPESAFE_API_KEY が無ければ各コマンドが非Jev経路にフォールバック)' if jev else '無効。使うなら spawn/compete/batch/patrol/adopt に --jev を付ける(要 TYPESAFE_API_KEY)'}"
     )
     ok = _send_prompt_devin(handle, prompt)
     print(json.dumps({"run": rid, "coordinator_terminal": handle,
-                      "allow": allow or "swe-2-high",
+                      "allow": allow or "swe-2-high", "jev": jev,
                       "prompt_submitted": ok}, indent=1))
 
 
@@ -693,9 +1144,11 @@ COMMANDS = {
     "task create": cmd_task_create,
     "spawn": cmd_spawn,
     "compete": cmd_compete,
+    "batch": cmd_batch,
     "wait": cmd_wait,
     "patrol": cmd_patrol,
     "collect": cmd_collect,
+    "score": cmd_score,
     "adopt": cmd_adopt,
     "integrate": cmd_integrate,
     "clean": cmd_clean,
