@@ -23,3 +23,6 @@
 - 迷ったら `ask`、ブロックなら `escalation`、5分毎に `heartbeat`
 - 完了は `worker_done --outcome <succeeded|failed>` を1回だけ。
   body にマージ方針・解消したコンフリクト・検証結果を書く
+- ツールhookにブロックされたら同じことを別手段で再試行しない。
+  専用read/edit/writeツールと `workdir` パラメータを使う
+  (`cd DIR && cmd`・shell経由のファイル操作はブロックされる)

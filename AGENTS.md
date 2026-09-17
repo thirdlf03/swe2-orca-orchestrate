@@ -46,12 +46,20 @@ Orca の思想に合わせ、**スケジューラは作らない**。Run は名�
 | 不採用残骸(170ファイル/3.1万行) | `orch clean --losers` で dispatch解放+worktree+端末を一括削除 | bin/orch |
 | `clean --losers` が spawn 直後の生きた integrator を kill(実測) | loser を「同クラスタに採用済み兄弟を持つ未adopt候補」と再定義。integrator/reviewer/採否未確定・再投入候補はマッチせず kept として報告。クラスタ放棄は `--cluster` | bin/orch |
 | medium が曖昧仕様を確認せず実装 | モデル配分表: 曖昧性高い仕事は medium に出さない + テンプレの「迷ったらask必須」 | tasks/template.md, playbook |
+| coordinator の `declare -A` が bash 3.2 で不発 → 別spec混入+連続spawn失敗(stale worktree 17個) | 大量投入は `orch batch <manifest.json>`(task/name/model対応をJSONで記述)。逐次spawn・間隔pacing・per-item retry・1件失敗でも継続 | bin/orch, playbook |
+| `worker-start failed` で worktree/branch/端末が残骸化(17 worktrees/62 branches) | spawn 失敗時は確保したリソースを全てロールバック | bin/orch |
+| `ORCH_ALLOW` がcoordinator生成のbackground shellに届かず max spawn が途中から失敗 | `--allow` を run の .orch/state.json に永続化。env→stateの順で判定 | bin/orch |
+| worker_done 後に成果物が未コミット(2件実測) | `orch collect` が dirty 数を表示、`orch adopt` が未コミットを warning | bin/orch, playbook |
+| spawn されたが devin が起動していない zombie dispatch が status 上は生きて見える(数時間検出不能) | `orch patrol` が未開始stateの滞留を `zombie?` として報告 | bin/orch |
+| 未ackメッセージが `check --wait` で再配信され処理がループ | `orch wait` は処理メッセージを自動ack。playbookに生 check 使用時の ack 義務を明記 | bin/orch, playbook |
+| ワーカーが毎回 hook に複数回ブロックされ代替を再学習(23hで308ステップ) | hook 遵守・代替手段を仕様テンプレに定型句として注入 | tasks/template.md |
 
 ## 使い方
 
 ```bash
 orch init                          # repo登録 + .orch/ 準備(対象repoのルートで)
 orch run create "<目的>"           # Run作成
+orch batch manifest.json           # 大量投入(JSONでtask/name/model対応。逐次+pacing+rollback)
 orch compete tasks/x.md -n 3 \
   --models swe-2-high,swe-2-medium,swe-2-medium
 orch wait --timeout-min 60         # イベント駆動で完了検知
@@ -67,8 +75,10 @@ orch status
 全自動モード: `orch boot requirement.md` がコーディネーター端末
 (swe-2-high, bypass)を立てて playbook を実行させる。
 `--allow swe-2-max` を付けると coordinator 自体が swe-2-max で起動し、
-`ORCH_ALLOW=swe-2-max` が環境変数に設定されてワーカー/インテグレーターにも
-max を配分できるようになる(ORCH_ALLOW 無しでの max 指定は orch が機械的に拒否)。
+許可が run の .orch/state.json に永続化されてワーカー/インテグレーターにも
+max を配分できるようになる(許可無しでの max 指定は orch が機械的に拒否。
+ORCH_ALLOW 環境変数は後方互換の補助経路 — background shell には届かない
+実測があるため state 永続化が本経路)。
 人間は要件投入と最終マージ承認だけ。
 
 ## モデル配分(実測特性より)
@@ -76,7 +86,7 @@ max を配分できるようになる(ORCH_ALLOW 無しでの max 指定は orch
 | 層 | モデル | 根拠 |
 |---|---|---|
 | コーディネーター | swe-2-high。`--allow swe-2-max` なら max | 審査・採否・統合判断が主業務 |
-| max全般 | `orch boot --allow swe-2-max` のRunのみ | `ORCH_ALLOW` 無しでの max 指定は spawn/compete/integrate が機械的に die |
+| max全般 | `orch boot --allow swe-2-max` のRunのみ | 許可は state.json に永続化。無許可での max 指定は spawn/compete/batch/integrate が機械的に die |
 | インテグレーター | swe-2-high | マージ方針の判断が成果物に直結 |
 | 候補ワーカー | 難易度で変える: 機械的=medium, 通常=high×1+medium, 創造/曖昧=high以上 | medium は曖昧仕様で確認せず進む実測あり |
 | レビュー/検証 | swe-2-medium〜high | チェックリスト型監査 |
@@ -84,6 +94,9 @@ max を配分できるようになる(ORCH_ALLOW 無しでの max 指定は orch
 ## やってはいけないこと
 
 - 素の `devin`(bypass無し)で無人ワーカーを起動しない — `orch spawn` を必ず使う
+- 複数ワーカーの投入を手書きシェルループ(特に `declare -A`)で組まない —
+  `orch batch` を使う。bash 3.2 には連想配列がなく、対応表が壊れて
+  spec混入+spawn storm の実測がある
 - sleep で完了を待たない — `orch wait` / `wait-for '<条件>'` を使う
 - 候補worktreeを直接編集しない(読むのは可)。本番への書き込みは integrator 経由
 - 採否確定後に不採用worktreeを放置しない — `orch clean` を機械的に回す

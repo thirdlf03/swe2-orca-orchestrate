@@ -6,7 +6,12 @@ failure-mode fixes so a coordinator agent (human-driven or swe-2) never
 re-derives them:
 
   spawn    worker = new worktree + `devin --model X --permission-mode bypass`
-           terminal + supervised dispatch (worker-start --terminal)
+           terminal + supervised dispatch (worker-start --terminal).
+           Any failure after worktree create rolls the worktree/branch/
+           terminal back — no stale wreckage from `worker-start failed`
+  batch    serial spawn loop from a JSON manifest (task→name/model map is
+           DATA, not a shell `declare -A`). Paced spawns + per-item retry;
+           one bad item doesn't kill the batch
   wait     event-driven `check --wait --types ...` + ack chaining
            (never sleep-polls; heartbeats can't spuriously wake it)
   patrol   sweeps live dispatches: permission-menu stalls, silent workers
@@ -232,53 +237,77 @@ def _send_prompt_devin(handle, prompt, retries=3):
     return False
 
 
+def _spawn_rollback(wid, handle, branch):
+    """Undo a half-spawn: close the terminal, force-rm the worktree, delete
+    the branch. Measured incident: `worker-start failed` left one stale
+    worktree+branch per attempt (17 worktrees / 62 branches accumulated in
+    one run). Rollback is best-effort — every step is check=False."""
+    if handle:
+        orca("terminal", "close", "--terminal", handle, check=False)
+    if wid:
+        orca("worktree", "rm", "--worktree", f"id:{wid}", "--force",
+             check=False)
+    if branch:
+        subprocess.run(["git", "branch", "-D", branch], capture_output=True)
+
+
 def _spawn_one(run, tid, name, model, base, setup, repo, st, role="worker"):
-    """worktree -> devin terminal (bypass!) -> worker-start --terminal."""
+    """worktree -> devin terminal (bypass!) -> worker-start --terminal.
+    Any failure after the worktree exists rolls all created resources back."""
     model = _canonical_model(model)
-    _check_model_allowed(model)
-    wargs = ["worktree", "create", "--name", name]
-    if base:
-        wargs += ["--base-branch", base]
-    if repo:
-        wargs += ["--repo", repo]
-    if setup:
-        wargs += ["--setup", setup]
-    w = orca(*wargs)
-    wid = find_key(w, "id")
-    branch = find_key(w, "branch") or ""
-    branch = re.sub(r"^refs/heads/", "", branch)
-    wpath = find_key(w, "path")
-    if not wid:
-        die(f"worktree create: no id in {json.dumps(w)[:400]}")
+    _check_model_allowed(model, st)
+    wid = branch = handle = None
+    try:
+        wargs = ["worktree", "create", "--name", name]
+        if base:
+            wargs += ["--base-branch", base]
+        if repo:
+            wargs += ["--repo", repo]
+        if setup:
+            wargs += ["--setup", setup]
+        w = orca(*wargs)
+        wid = find_key(w, "id")
+        branch = find_key(w, "branch") or ""
+        branch = re.sub(r"^refs/heads/", "", branch)
+        wpath = find_key(w, "path")
+        if not wid:
+            die(f"worktree create: no id in {json.dumps(w)[:400]}")
 
-    cmd = f"{DEVIN} --model {model} --permission-mode bypass"
-    t = orca("terminal", "create", "--worktree", f"id:{wid}",
-             "--title", name, "--command", cmd)
-    handle = find_key(t, "handle")
-    if not handle:
-        die(f"terminal create: no handle in {json.dumps(t)[:400]}")
-    _wait_devin_ready(handle)
+        cmd = f"{DEVIN} --model {model} --permission-mode bypass"
+        t = orca("terminal", "create", "--worktree", f"id:{wid}",
+                 "--title", name, "--command", cmd)
+        handle = find_key(t, "handle")
+        if not handle:
+            die(f"terminal create: no handle in {json.dumps(t)[:400]}")
+        _wait_devin_ready(handle)
 
-    ws = orca("orchestration", "worker-start", "--task", tid,
-              "--terminal", handle, "--worktree", f"id:{wid}", check=False)
-    # devin is not a known-agent: if the prompt landed but stalled at the
-    # input box ([Pasted text ...] unsubmitted), press Enter once to submit.
-    if not ws or find_key(ws, "lastError") == "agent_prompt_stalled" \
-            or find_key(ws, "state") == "failed":
-        _submit_pending_paste(handle)
         ws = orca("orchestration", "worker-start", "--task", tid,
                   "--terminal", handle, "--worktree", f"id:{wid}", check=False)
-    if not ws or find_key(ws, "state") == "failed":
-        die(f"worker-start failed: {json.dumps(ws)[:600]}")
-    did = find_key(ws, "dispatchId") or find_key(ws, "dispatch") or find_key(ws, "id")
-    rec = {"dispatch": did, "task": tid, "name": name, "model": model,
-           "role": role, "worktree": wid, "path": wpath, "branch": branch,
-           "terminal": handle, "spawned_at": int(time.time()),
-           "status": "active", "adopted": False}
-    run["dispatches"][did] = rec
-    run["tasks"].setdefault(tid, {}).setdefault("dispatches", []).append(did)
-    state_save(st)
-    return rec
+        # devin is not a known-agent: if the prompt landed but stalled at the
+        # input box ([Pasted text ...] unsubmitted), press Enter once to submit.
+        if not ws or find_key(ws, "lastError") == "agent_prompt_stalled" \
+                or find_key(ws, "state") == "failed":
+            _submit_pending_paste(handle)
+            ws = orca("orchestration", "worker-start", "--task", tid,
+                      "--terminal", handle, "--worktree", f"id:{wid}",
+                      check=False)
+        if not ws or find_key(ws, "state") == "failed":
+            die("worker-start failed: "
+                f"{json.dumps(ws)[:600]}\nscreen tail: "
+                f"{_screen_tail(handle, 10)[:400]}")
+        did = (find_key(ws, "dispatchId") or find_key(ws, "dispatch")
+               or find_key(ws, "id"))
+        rec = {"dispatch": did, "task": tid, "name": name, "model": model,
+               "role": role, "worktree": wid, "path": wpath, "branch": branch,
+               "terminal": handle, "spawned_at": int(time.time()),
+               "status": "active", "adopted": False}
+        run["dispatches"][did] = rec
+        run["tasks"].setdefault(tid, {}).setdefault("dispatches", []).append(did)
+        state_save(st)
+        return rec
+    except BaseException:
+        _spawn_rollback(wid, handle, branch)
+        raise
 
 
 # uids whose tier is Max (`devin models list`, 2026-09). Note swe-1-7 and
@@ -293,11 +322,17 @@ def _canonical_model(model):
             "max": "swe-2-max"}.get(model.strip().lower(), model.strip())
 
 
-def _check_model_allowed(model):
-    """Max-tier models are gated on ORCH_ALLOW (set by `orch boot --allow
-    swe-2-max`). Coordinators run orch inside the booted terminal, so the env
-    var is the mechanical allowlist — a coordinator ignoring the playbook
-    still dies here.
+def _check_model_allowed(model, st=None):
+    """Max-tier models are gated on ORCH_ALLOW (`orch boot --allow swe-2-max`).
+    The gate consults TWO sources, either suffices:
+
+      1. env ORCH_ALLOW=swe-2-max — set by boot in the coordinator terminal
+      2. run["allow"] persisted in .orch/state.json by `orch boot --allow`
+
+    (2) exists because a measured incident had ORCH_ALLOW lost inside a
+    coordinator-spawned BACKGROUND shell — env vars don't propagate to
+    shells the coordinator starts later, so max-worker spawns were
+    mysteriously rejected mid-run.
 
     devin's --model accepts fuzzy names (alias or partial), so we can't just
     compare == 'swe-2-max': 'max', 'swe-2-ma', or a bare family slug like
@@ -305,10 +340,18 @@ def _check_model_allowed(model):
     containing 'max' plus any prefix of a known max-tier uid — an ambiguous
     prefix like 'swe-2-m' dies too; use explicit variant names."""
     m = model.strip().lower()
-    if ("max" in m or any(u.startswith(m) for u in MAX_TIER_UIDS)) \
-            and os.environ.get("ORCH_ALLOW") != "swe-2-max":
-        die(f"model '{model}' is max-tier: requires "
-            "`orch boot --allow swe-2-max` (ORCH_ALLOW unset)")
+    if "max" not in m and not any(u.startswith(m) for u in MAX_TIER_UIDS):
+        return
+    if os.environ.get("ORCH_ALLOW") == "swe-2-max":
+        return
+    if st is None:
+        st = state_load()
+    run = (st.get("runs") or {}).get(st.get("current_run") or "", {})
+    if run.get("allow") == "swe-2-max":
+        return
+    die(f"model '{model}' is max-tier: requires "
+        "`orch boot --allow swe-2-max` (no ORCH_ALLOW env and no persisted "
+        "allow in .orch/state.json)")
 
 
 def cmd_spawn(args):
@@ -318,7 +361,7 @@ def cmd_spawn(args):
     st = state_load()
     _, run = cur_run(st)
     model = args.get("--model") or "swe-2-medium"
-    _check_model_allowed(model)
+    _check_model_allowed(model, st)
     rec = _spawn_one(run, task, args.get("--name") or f"w-{task[-6:]}",
                      model,
                      args.get("--base"), args.get("--setup") or "run",
@@ -336,12 +379,12 @@ def cmd_compete(args):
     models = [m.strip() for m in (args.get("--models") or "").split(",") if m.strip()]
     default_models = ["swe-2-high"] + ["swe-2-medium"] * (n - 1)
     models = (models + default_models)[:n]
-    for m in models:
-        _check_model_allowed(m)
-    cluster = args.get("--cluster") or os.path.splitext(os.path.basename(spec_file))[0]
-    spec = open(spec_file).read()
     st = state_load()
     rid, run = cur_run(st)
+    for m in models:
+        _check_model_allowed(m, st)
+    cluster = args.get("--cluster") or os.path.splitext(os.path.basename(spec_file))[0]
+    spec = open(spec_file).read()
     recs = []
     for i in range(n):
         title = f"{cluster}-{i+1}"
@@ -355,6 +398,97 @@ def cmd_compete(args):
                          args.get("--repo"), st, role="candidate")
         recs.append(rec)
     print(json.dumps(recs, indent=1))
+
+
+def cmd_batch(args):
+    """Serial spawn loop driven by a JSON manifest — the mass-spawn path.
+
+    Measured incident: a coordinator hand-rolled a bash loop with
+    `declare -A` (absent on macOS bash 3.2) to map tasks→models; the map
+    silently broke, dispatching a WRONG spec to one worker and storming
+    `worker-start failed` on the rest (17 stale worktrees). Putting the
+    assignment in a JSON file makes the mapping auditable data, and
+    keeping the loop inside orch gives pacing/rollback/retry for free.
+
+    Manifest:
+      {"defaults": {"model": "swe-2-medium", "setup": "run", "base": null},
+       "items": [
+         {"spec_file": "tasks/w01.md", "title": "w01", "cluster": "works",
+          "name": "w01-x", "model": "swe-2-high"},
+         {"task": "task_abc", "name": "w-retry", "model": "swe-2-medium"}
+       ]}
+    Each item needs EITHER "task" (existing task id) OR "spec_file"
+    (creates a task first; title/cluster default from the file name).
+    """
+    files = args["_"]
+    if not files:
+        die("usage: orch batch <manifest.json> [--gap-sec N] [--retries N]")
+    man = json.loads(open(files[0]).read())
+    items = man.get("items") or []
+    if not items:
+        die("manifest has no items")
+    defaults = man.get("defaults") or {}
+    gap = float(args.get("--gap-sec") or 8)
+    retries = int(args.get("--retries") or 1)
+    st = state_load()
+    rid, run = cur_run(st)
+    for it in items:
+        _check_model_allowed(it.get("model") or defaults.get("model")
+                             or "swe-2-medium", st)
+
+    ok, failed = [], []
+    for i, it in enumerate(items):
+        if i:
+            time.sleep(gap)   # pacing: back-to-back spawns triggered
+                              # `worker-start failed: null` (rate limit?)
+        try:
+            tid = it.get("task")
+            if not tid:
+                spec_file = it.get("spec_file")
+                if not spec_file:
+                    raise ValueError("item needs 'task' or 'spec_file'")
+                spec = open(spec_file).read()
+                title = (it.get("title")
+                         or os.path.splitext(os.path.basename(spec_file))[0])
+                r = orca("orchestration", "task-create", "--spec", spec,
+                         "--task-title", title, "--run", rid)
+                tid = find_key(r, "id") or find_key(r, "taskId")
+                run["tasks"][tid] = {
+                    "title": title, "spec_file": spec_file,
+                    "cluster": it.get("cluster") or man.get("cluster"),
+                    "deps": [], "dispatches": []}
+            name = it.get("name") or f"w-{tid[-6:]}"
+            model = (it.get("model") or defaults.get("model")
+                     or "swe-2-medium")
+            rec = None
+            err = None
+            for attempt in range(retries + 1):
+                try:
+                    rec = _spawn_one(
+                        run, tid, name, model,
+                        it.get("base") or defaults.get("base"),
+                        it.get("setup") or defaults.get("setup") or "run",
+                        it.get("repo") or defaults.get("repo"), st,
+                        role=it.get("role") or "worker")
+                    break
+                except SystemExit as e:
+                    err = e
+                    if attempt < retries:
+                        time.sleep(max(gap, 15))
+            if rec:
+                ok.append({"name": name, "dispatch": rec["dispatch"]})
+            else:
+                failed.append({"name": name, "error": str(err)})
+                print(f"orch: spawn failed for {name}: {err}",
+                      file=sys.stderr)
+        except Exception as e:
+            failed.append({"name": it.get("name") or "?", "error": str(e)})
+            print(f"orch: item failed: {e}", file=sys.stderr)
+    state_save(st)
+    print(json.dumps({"spawned": ok, "failed": failed},
+                     indent=1, ensure_ascii=False))
+    if failed:
+        sys.exit(2)
 
 
 WAIT_TYPES = "worker_done,escalation,question"
@@ -422,6 +556,12 @@ def _permission_menu_key(text):
     return None
 
 
+# worker-show states meaning "accepted but not yet executing" — a dispatch
+# stuck here past --stale-min is a zombie, not a slow worker
+NEVER_STARTED_STATES = {"dispatched", "pending", "created", "starting",
+                        "accepted", "queued"}
+
+
 def cmd_patrol(args):
     st = state_load()
     _, run = cur_run(st)
@@ -450,11 +590,31 @@ def cmd_patrol(args):
                      "--enter", check=False)
                 entry["issues"].append(f"rescued:key={key}")
         idle = now - d.get("spawned_at", now)
-        if idle > stale_s and wstate in ("ready", "running", "active", "?"):
-            # no heartbeat tracking in state file; flag long-running actives for eyeball
-            entry["issues"].append(f"running>{int(idle/60)}m")
+        if idle > stale_s:
+            if wstate in ("ready", "running", "active", "?"):
+                # no heartbeat tracking in state file; flag long-running
+                # actives for eyeball
+                entry["issues"].append(f"running>{int(idle/60)}m")
+            elif wstate in NEVER_STARTED_STATES:
+                # measured incident: a dispatch whose devin session never
+                # started (prompt injection silently failed) sat for hours
+                # looking identical to a live worker in `orch status`
+                entry["issues"].append(
+                    f"zombie? state={wstate} for {int(idle/60)}m "
+                    "(spawned but never started — likely a failed prompt "
+                    "injection; clean + respawn)")
         report.append(entry)
     print(json.dumps(report, indent=1, ensure_ascii=False))
+
+
+def _git_dirty(path):
+    """Uncommitted paths in a worktree (worker commit-forgetfulness is a
+    measured failure — `orch adopt` used to silently adopt empty branches)."""
+    if not path or not os.path.isdir(path):
+        return []
+    p = subprocess.run(["git", "-C", path, "status", "--porcelain"],
+                       capture_output=True, text=True)
+    return [ln for ln in p.stdout.splitlines() if ln.strip()]
 
 
 def cmd_collect(args):
@@ -469,6 +629,7 @@ def cmd_collect(args):
             "status": find_key(ws, "status") or find_key(ws, "state") or d["status"],
             "outcome": find_key(ws, "outcome"),
             "adopted": d.get("adopted", False),
+            "dirty": len(_git_dirty(d.get("path"))),
         })
     print(json.dumps(rows, indent=1, ensure_ascii=False))
 
@@ -481,11 +642,19 @@ def cmd_adopt(args):
     _, run = cur_run(st)
     if did not in run["dispatches"]:
         die(f"unknown dispatch {did}")
-    run["dispatches"][did]["adopted"] = True
-    run["dispatches"][did]["adopted_at"] = int(time.time())
+    d = run["dispatches"][did]
+    dirty = _git_dirty(d.get("path"))
+    d["adopted"] = True
+    d["adopted_at"] = int(time.time())
     state_save(st)
-    print(json.dumps({"adopted": did,
-                      "branch": run["dispatches"][did].get("branch")}))
+    out = {"adopted": did, "branch": d.get("branch")}
+    if dirty:
+        # warn, don't block: the coordinator may adopt intentionally, but a
+        # measured incident had worker_done fire with artifacts uncommitted
+        out["warning"] = (f"worktree has {len(dirty)} uncommitted paths — "
+                          "adopting merges only what's committed")
+        out["dirty_paths"] = dirty[:20]
+    print(json.dumps(out, ensure_ascii=False))
 
 
 def cmd_integrate(args):
@@ -495,13 +664,13 @@ def cmd_integrate(args):
     if not topic or not branches:
         die("usage: orch integrate --topic <t> --branches b1,b2 [--model M] [--verify 'cmd']")
     integ_model = args.get("--model") or "swe-2-high"
-    _check_model_allowed(integ_model)
+    st = state_load()
+    _check_model_allowed(integ_model, st)
     tpl_path = os.path.join(HARNESS_DIR, "tasks", "integrator.template.md")
     tpl = open(tpl_path).read()
     spec = (tpl.replace("{{TOPIC}}", topic)
                .replace("{{BRANCHES}}", branches)
                .replace("{{VERIFY}}", args.get("--verify") or "(repo の検証コマンド)"))
-    st = state_load()
     rid, run = cur_run(st)
     r = orca("orchestration", "task-create", "--spec", spec,
              "--task-title", f"integ-{topic}", "--run", rid)
@@ -654,12 +823,15 @@ def cmd_boot(args):
     rid = find_key(r, "id") or find_key(r, "runId")
     st = state_load()
     st["runs"][rid] = {"objective": obj, "created_at": int(time.time()),
-                     "tasks": {}, "dispatches": {}}
+                     "tasks": {}, "dispatches": {}, "allow": allow}
     st["current_run"] = rid
     state_save(st)
 
     # coordinator is swe-2-high by default; --allow swe-2-max upgrades the
-    # coordinator itself to max AND exports ORCH_ALLOW so workers can use it.
+    # coordinator itself to max AND lets workers use max. The allow is
+    # persisted in run state (above) so it survives background shells that
+    # lose ORCH_ALLOW — env vars don't reach shells the coordinator spawns
+    # later (measured incident: max spawns rejected mid-run).
     model = allow or "swe-2-high"
     # Always set ORCH_ALLOW explicitly: `env ORCH_ALLOW=` (empty) clears a
     # value leaked from the shell running `orch boot`, so --allow-less runs
@@ -677,7 +849,7 @@ def cmd_boot(args):
         f"1. まず `orca orchestration run-use --id {rid}` でこの端末をRunにbindする\n"
         f"2. {playbook} を読み、要件ファイル {req} に対して実行する\n"
         f"3. ハーネスCLI: {HARNESS_DIR}/bin/orch (stateはこの端末のcwdの .orch/)\n"
-        f"4. モデル上限: {'swe-2-max まで使用可 (ORCH_ALLOW=swe-2-max が環境変数に設定済み)' if allow else 'swe-2-high まで。swe-2-max はこのRunでは禁止'}"
+        f"4. モデル上限: {'swe-2-max まで使用可 (allow は .orch/state.json に永続化済み・バックグラウンドシェルからでも有効)' if allow else 'swe-2-high まで。swe-2-max はこのRunでは禁止'}"
     )
     ok = _send_prompt_devin(handle, prompt)
     print(json.dumps({"run": rid, "coordinator_terminal": handle,
@@ -693,6 +865,7 @@ COMMANDS = {
     "task create": cmd_task_create,
     "spawn": cmd_spawn,
     "compete": cmd_compete,
+    "batch": cmd_batch,
     "wait": cmd_wait,
     "patrol": cmd_patrol,
     "collect": cmd_collect,
