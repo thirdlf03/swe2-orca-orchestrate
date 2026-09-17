@@ -81,25 +81,36 @@ orch status
 max を配分できるようになる(許可無しでの max 指定は orch が機械的に拒否。
 ORCH_ALLOW 環境変数は後方互換の補助経路 — background shell には届かない
 実測があるため state 永続化が本経路)。
+`--jev` を付けるとこのRun全体で Jev 連携が有効化され(下記「実験」節)、
+coordinator の prompt に使い方が注入される。
 人間は要件投入と最終マージ承認だけ。
 
 ## 実験: Jev 連携(意味判定の安い層)
 
-`--jev` フラグ + `TYPESAFE_API_KEY` の両方がある時だけ有効。
+`orch boot --jev` で Run 単位に有効化するのが正規の使い方
+(個別コマンドの `--jev` フラグ or `ORCH_JEV` env でも有効化できる)。
+有効化の判定は 3経路 — フラグ / env / run の `.orch/state.json` 永続化。
+ORCH_ALLOW と同じ教訓で state が本経路。全経路とも `TYPESAFE_API_KEY` が
+必要で、キー無し・API障害時は全て非Jev経路にフォールバックする
+(early-access API を単一障害点にしない)。差分/report.md が外部APIに
+送られる点だけ注意。
+
 TypeSafe Jev(System One 決定モデル)で「機械判定」と「コーディネーター審査」の
-間の意味判定を肩代わりする。API 障害時は全て非Jev経路にフォールバックする
-(early-access API を単一障害点にしない)。差分/report.md が外部APIに送られる
-点だけ注意。
+間の意味判定を肩代わりする。
 
 | 場所 | 動作 |
 |---|---|
+| `orch boot --jev` | Run 全体で Jev 有効化。coordinator prompt に利用方法を注入 |
 | `orch score` | 候補を spec 適合度(noul)+採用価値(score)でランキング。advisory |
-| `spawn/compete/batch --jev` | spec 曖昧性を採点。曖昧(p>=0.7)×medium は機械的に die、他層は警告 |
-| `patrol --jev` | screen tail を読んで「停止/待機中か」を判定 → `jev-stuck:p=` を issues に追加 |
-| `adopt --jev` | 完了主張の妥当性を採点。低確率なら warning(dirty warning と併記) |
+| `spawn/compete/batch` | spec 曖昧性を採点(vague/divergent の max)。曖昧(p>=0.7)×medium は機械的に die、他層は警告 |
+| `patrol` | screen tail を読んで「停止/待機中か」を判定 → `jev-stuck:p=` を issues に追加 |
+| `adopt` | 完了主張の妥当性を採点。低確率なら warning(dirty warning と併記) |
 
 採否の最終決定には使わない — 「判断はコーディネーターの仕事」の原則を
 壊さない範囲で、候補の絞り込みと警告に留める。
+実API校正済み: 空spec p=0.94ブロック / ルール未定spec 0.73ブロック /
+機械リネームspec <0.4 スルー。誤ブロックが多ければ
+`JEV_AMBIGUITY_BLOCK`(0.7) を上げるのが調整ポイント。
 
 ## モデル配分(実測特性より)
 

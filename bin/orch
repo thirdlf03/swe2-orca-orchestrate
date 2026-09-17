@@ -384,14 +384,27 @@ JEV_AMBIGUITY_BLOCK = 0.7   # P(ambiguous) >= this + swe-2-medium -> die
 JEV_AMBIGUITY_WARN = 0.4    # P(ambiguous) >= this -> stderr warning
 
 
-def _jev_enabled(args):
-    """Both gates: --jev flag and TYPESAFE_API_KEY. Flag-without-key warns
-    once and proceeds without Jev rather than dying."""
-    if not args.get("--jev"):
+def _jev_enabled(args, st=None):
+    """Opt-in paths (any suffices), ALL requiring TYPESAFE_API_KEY:
+      1. --jev flag on the command
+      2. ORCH_JEV env — set in the coordinator terminal by `boot --jev`
+      3. run["jev"] persisted by `orch boot --jev` — the durable path,
+         since env vars don't reach coordinator-spawned background shells
+         (same lesson as ORCH_ALLOW)
+    Opt-in without a key warns once and proceeds without Jev rather than
+    dying — Jev is advisory and must never break a run."""
+    want = bool(args.get("--jev") or os.environ.get("ORCH_JEV"))
+    if not want:
+        if st is None:
+            st = state_load()
+        run = (st.get("runs") or {}).get(st.get("current_run") or "", {})
+        want = bool(run.get("jev"))
+    if not want:
         return False
     if not os.environ.get("TYPESAFE_API_KEY"):
-        print("orch: --jev set but TYPESAFE_API_KEY is not in the "
-              "environment; continuing without Jev", file=sys.stderr)
+        print("orch: Jev is enabled for this run but TYPESAFE_API_KEY is "
+              "not in the environment; continuing without Jev",
+              file=sys.stderr)
         return False
     return True
 
@@ -430,9 +443,9 @@ def _task_spec_text(run, tid):
     return None
 
 
-def _jev_spec_ambiguity(spec_text, args):
+def _jev_spec_ambiguity(spec_text, args, st=None):
     """P(spec is unsafe for an autonomous worker) per Jev, or None when
-    --jev is off / the call fails / there's no spec text to judge.
+    Jev is off / the call fails / there's no spec text to judge.
 
     Ambiguity has TWO failure modes (real-API calibration: a nearly empty
     spec scored low on "divergent readings" because it offers zero
@@ -441,7 +454,7 @@ def _jev_spec_ambiguity(spec_text, args):
       vague     — not enough detail to start without guessing
       divergent — two reasonable readings yield different deliverables
     """
-    if not _jev_enabled(args) or not spec_text:
+    if not _jev_enabled(args, st) or not spec_text:
         return None
     answers = _jev_ask(
         "Task spec handed to an autonomous coding worker:\n\n"
@@ -514,7 +527,7 @@ def cmd_spawn(args):
     model = args.get("--model") or "swe-2-medium"
     _check_model_allowed(model, st)
     _spec_gate_apply(
-        _jev_spec_ambiguity(_task_spec_text(run, task), args), [model])
+        _jev_spec_ambiguity(_task_spec_text(run, task), args, st), [model])
     rec = _spawn_one(run, task, args.get("--name") or f"w-{task[-6:]}",
                      model,
                      args.get("--base"), args.get("--setup") or "run",
@@ -537,7 +550,7 @@ def cmd_compete(args):
     for m in models:
         _check_model_allowed(m, st)
     spec = open(spec_file).read()
-    _spec_gate_apply(_jev_spec_ambiguity(spec, args), models)
+    _spec_gate_apply(_jev_spec_ambiguity(spec, args, st), models)
     cluster = args.get("--cluster") or os.path.splitext(os.path.basename(spec_file))[0]
     recs = []
     for i in range(n):
@@ -618,7 +631,7 @@ def cmd_batch(args):
             _spec_gate_apply(
                 _jev_spec_ambiguity(
                     spec if spec is not None
-                    else _task_spec_text(run, tid), args),
+                    else _task_spec_text(run, tid), args, st),
                 [model])
             rec = None
             err = None
@@ -725,7 +738,7 @@ NEVER_STARTED_STATES = {"dispatched", "pending", "created", "starting",
 def cmd_patrol(args):
     st = state_load()
     _, run = cur_run(st)
-    jev = _jev_enabled(args)
+    jev = _jev_enabled(args, st)
     stale_s = float(args.get("--stale-min") or 12) * 60
     now = time.time()
     report = []
@@ -821,7 +834,7 @@ def cmd_adopt(args):
     d = run["dispatches"][did]
     dirty = _git_dirty(d.get("path"))
     warnings = []
-    if _jev_enabled(args):
+    if _jev_enabled(args, st):
         # done-claim sanity: measured failures had worker_done fire with
         # artifacts uncommitted / verification skipped. Advisory — adoption
         # stays the coordinator's judgment.
@@ -1071,20 +1084,23 @@ def cmd_boot(args):
     """Spawn a coordinator devin terminal that runs playbooks/coordinator.md."""
     files = args["_"]
     if not files:
-        die("usage: orch boot <requirement-file> [--allow swe-2-max] [--worktree sel]")
+        die("usage: orch boot <requirement-file> [--allow swe-2-max] "
+            "[--jev] [--worktree sel]")
     if args.get("--model"):
         die("--model is gone: coordinator defaults to swe-2-high. "
             "Use --allow swe-2-max to run the coordinator and workers on max")
     allow = args.get("--allow")
     if allow and allow != "swe-2-max":
         die(f"unknown --allow value: {allow} (only swe-2-max is allow-able)")
+    jev = bool(args.get("--jev"))
     req = os.path.abspath(files[0])
     obj = open(req).read().strip().splitlines()[0][:200]
     r = orca("orchestration", "run-create", "--objective", obj)
     rid = find_key(r, "id") or find_key(r, "runId")
     st = state_load()
     st["runs"][rid] = {"objective": obj, "created_at": int(time.time()),
-                     "tasks": {}, "dispatches": {}, "allow": allow}
+                     "tasks": {}, "dispatches": {}, "allow": allow,
+                     "jev": jev}
     st["current_run"] = rid
     state_save(st)
 
@@ -1094,10 +1110,11 @@ def cmd_boot(args):
     # lose ORCH_ALLOW — env vars don't reach shells the coordinator spawns
     # later (measured incident: max spawns rejected mid-run).
     model = allow or "swe-2-high"
-    # Always set ORCH_ALLOW explicitly: `env ORCH_ALLOW=` (empty) clears a
-    # value leaked from the shell running `orch boot`, so --allow-less runs
-    # can't inherit max permission from the caller's environment.
-    cmd = (f"env ORCH_ALLOW={allow or ''} "
+    # Same for --jev: persisted in run state so every orch command in this
+    # run sees Jev as opted-in even without the flag. Both env vars are
+    # set explicitly — an empty value clears anything leaked from the
+    # shell that ran `orch boot`.
+    cmd = (f"env ORCH_ALLOW={allow or ''} ORCH_JEV={'1' if jev else ''} "
            f"{DEVIN} --model {model} --permission-mode bypass")
     wt = _resolve_worktree(args)
     t = orca("terminal", "create", "--worktree", wt, "--title", "coordinator",
@@ -1110,11 +1127,12 @@ def cmd_boot(args):
         f"1. まず `orca orchestration run-use --id {rid}` でこの端末をRunにbindする\n"
         f"2. {playbook} を読み、要件ファイル {req} に対して実行する\n"
         f"3. ハーネスCLI: {HARNESS_DIR}/bin/orch (stateはこの端末のcwdの .orch/)\n"
-        f"4. モデル上限: {'swe-2-max まで使用可 (allow は .orch/state.json に永続化済み・バックグラウンドシェルからでも有効)' if allow else 'swe-2-high まで。swe-2-max はこのRunでは禁止'}"
+        f"4. モデル上限: {'swe-2-max まで使用可 (allow は .orch/state.json に永続化済み・バックグラウンドシェルからでも有効)' if allow else 'swe-2-high まで。swe-2-max はこのRunでは禁止'}\n"
+        f"5. Jev: {'このRunは --jev 有効。`orch score` で候補を事前採点して上位だけ実物審査し、spawn/compete/batch/patrol/adopt の Jev 判定は state 永続化により自動で効く(TYPESAFE_API_KEY が無ければ各コマンドが非Jev経路にフォールバック)' if jev else '無効。使うなら spawn/compete/batch/patrol/adopt に --jev を付ける(要 TYPESAFE_API_KEY)'}"
     )
     ok = _send_prompt_devin(handle, prompt)
     print(json.dumps({"run": rid, "coordinator_terminal": handle,
-                      "allow": allow or "swe-2-high",
+                      "allow": allow or "swe-2-high", "jev": jev,
                       "prompt_submitted": ok}, indent=1))
 
 
