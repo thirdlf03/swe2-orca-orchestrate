@@ -431,22 +431,38 @@ def _task_spec_text(run, tid):
 
 
 def _jev_spec_ambiguity(spec_text, args):
-    """P(spec is ambiguous) per Jev, or None when --jev is off / the call
-    fails / there's no spec text to judge."""
+    """P(spec is unsafe for an autonomous worker) per Jev, or None when
+    --jev is off / the call fails / there's no spec text to judge.
+
+    Ambiguity has TWO failure modes (real-API calibration: a nearly empty
+    spec scored low on "divergent readings" because it offers zero
+    interpretations, while a spec with one undecided rule scored high) —
+    so we decompose per the System One docs and take the max:
+      vague     — not enough detail to start without guessing
+      divergent — two reasonable readings yield different deliverables
+    """
     if not _jev_enabled(args) or not spec_text:
         return None
     answers = _jev_ask(
         "Task spec handed to an autonomous coding worker:\n\n"
         + spec_text[:6000],
-        {"ambiguity": {
+        {"vague": {
             "type": "noul",
-            "instructions": "A competent worker could reasonably interpret "
-                            "this spec two different ways, or a key "
-                            "requirement/constraint is left unspecified"}})
+            "instructions": "This spec lacks enough detail for a worker to "
+                            "start without guessing at the goal, the "
+                            "deliverable, or how success is judged"},
+         "divergent": {
+            "type": "noul",
+            "instructions": "Two competent workers could build materially "
+                            "DIFFERENT deliverables from this spec because "
+                            "a decision that changes the outcome is left "
+                            "unspecified — not merely missing minor details "
+                            "a worker can reasonably default"}})
     if not answers:
         return None
-    p = (answers.get("ambiguity") or {}).get("noul")
-    return float(p) if p is not None else None
+    ps = [float(a["noul"]) for a in answers.values()
+          if a.get("noul") is not None]
+    return max(ps) if ps else None
 
 
 def _spec_gate_apply(p, models):
