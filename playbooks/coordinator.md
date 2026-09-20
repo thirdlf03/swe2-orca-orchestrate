@@ -76,6 +76,19 @@ orch batch manifest.json                      # 大量投入はこれ(下記)
 結果は `{"spawned": [...], "failed": [...]}` で返り、failed があれば
 exit 2 で終わるので補完投入の判断材料にする。
 
+**並列上限cap(既定10)**: アクティブなdevinセッション数(15分超idleは除外)が cap に達すると
+spawn/compete/batch/integrate は機械的に拒否される
+(free model rate limit はアカウント共通 — 30並列で全滅した実測)。
+cap 到達で batch は残アイテムを `deferred` として返す(exit 3)。
+ワーカー完了後は `orch clean` で枠を解放してから次の波を投入する。
+波のサイズは「cap − 現在の生存数」で決める(`orch status` が両方出す)。
+
+**投入順**: `--sort-weight` を付けると manifest を重さ予測の降順
+(LPT)で並べて投入する — 重いタスクほど早く始める方が「統合が最遅
+ワーカー待ち」のテールが縮む。事前確認は `orch estimate manifest.json`
+(spawnせず予測だけ見る)。各spawnの予測は `.orch/estimates.jsonl` に
+記録され `orch weights` で実績と照合できる。
+
 全ての独立タスクを作ってから待機に入る(逐次投入しない)。
 
 ## 4. 監視
