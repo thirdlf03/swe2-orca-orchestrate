@@ -31,6 +31,10 @@ re-derives them:
   boot     spawn a coordinator terminal running playbooks/coordinator.md
   task     task-create wrapper (deps-aware)
   status   dashboard of run/tasks/dispatches
+  weights  spawn-time weight estimates vs actual worker metrics
+           (.orch/estimates.jsonl, reviewable later)
+  estimate preview weight estimates for a manifest or spec files
+           (heaviest-first — the order that minimizes makespan)
 
 Local state (dispatch -> worktree/branch/terminal) lives in
 `.orch/state.json` in the current directory. Add `.orch/` to .gitignore.
@@ -38,9 +42,11 @@ Local state (dispatch -> worktree/branch/terminal) lives in
 Requires: orca CLI on PATH (or $ORCA_CLI_COMMAND), devin CLI for workers.
 Python 3.9+, stdlib only.
 """
+import collections
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import time
@@ -245,6 +251,263 @@ def _send_prompt_devin(handle, prompt, retries=3):
     return False
 
 
+# ---------- parallel cap (account-wide free-model rate limit) ----------
+#
+# Measured incident (2026-09-18): a 30-worker batch had every session —
+# high AND max — die at once with "Reached free model rate limit" after
+# ~35 min at 19-24 concurrent generations; <=4 concurrent never trips it.
+# The quota is account-wide, so the enforceable proxy is live devin
+# session count across the WHOLE machine (interactive sessions and other
+# runs included), not just this run's dispatches.
+
+LOCK_DIR = os.path.expanduser("~/.local/share/devin/cli/session_locks")
+DEFAULT_PARALLEL_CAP = 10
+DEFAULT_IDLE_MIN = 15
+
+
+def _idle_min():
+    try:
+        return int(os.environ.get("ORCH_PARALLEL_IDLE_MIN",
+                                  DEFAULT_IDLE_MIN))
+    except ValueError:
+        return DEFAULT_IDLE_MIN
+
+
+def _live_devin_count():
+    """ACTIVE devin CLI sessions: lock files whose PID is alive AND whose
+    executable is the devin binary AND whose last_activity_at (sessions.db)
+    is within ORCH_PARALLEL_IDLE_MIN minutes (default 15; 0 = count every
+    live process, idle or not). Stale lock files persist after exit and
+    PIDs get recycled — both are filtered by the comm check. Sessions
+    missing from sessions.db are counted (unknown = conservative)."""
+    import glob
+    slugs = []
+    for path in glob.glob(os.path.join(LOCK_DIR, "*.lock")):
+        try:
+            pid = int(open(path).read().strip())
+            comm = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "comm="],
+                capture_output=True, text=True, timeout=3).stdout.strip()
+            if os.path.basename(comm) == "devin":
+                slugs.append(os.path.basename(path)[:-5])
+        except Exception:
+            continue
+    idle = _idle_min()
+    if idle <= 0 or not slugs:
+        return len(slugs)
+    cutoff = time.time() - idle * 60
+    act = {}
+    try:
+        db = _ro_db(DEVIN_DB)
+        for sid, la in db.execute(
+                "SELECT id, last_activity_at FROM sessions"):
+            act[sid] = la or 0
+    except Exception:
+        return len(slugs)   # can't measure activity -> count all live
+    return sum(1 for s in slugs
+               if s not in act or act[s] >= cutoff)
+
+
+def _live_devin_count_raw():
+    """All live devin processes regardless of activity (for status)."""
+    import glob
+    n = 0
+    for path in glob.glob(os.path.join(LOCK_DIR, "*.lock")):
+        try:
+            pid = int(open(path).read().strip())
+            comm = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "comm="],
+                capture_output=True, text=True, timeout=3).stdout.strip()
+            if os.path.basename(comm) == "devin":
+                n += 1
+        except Exception:
+            continue
+    return n
+
+
+def _parallel_cap(st):
+    """ORCH_PARALLEL_CAP env > run['parallel_cap'] (persisted by
+    `orch boot --cap`) > default. 0 disables."""
+    v = os.environ.get("ORCH_PARALLEL_CAP")
+    if not v:
+        run = (st.get("runs") or {}).get(st.get("current_run") or "", {})
+        v = run.get("parallel_cap")
+    try:
+        return int(v) if v is not None else DEFAULT_PARALLEL_CAP
+    except (TypeError, ValueError):
+        return DEFAULT_PARALLEL_CAP
+
+
+class ParallelCapReached(Exception):
+    pass
+
+
+# ---------- task weight estimation ----------
+#
+# Every dispatched worker's first prompt embeds its orca task id, so a
+# devin session joins to orchestration.db tasks.spec. From the join we
+# get per-(model, spec-length) medians of input/output tokens and
+# generation time (sum of per-turn total_time_ms — wall-clock duration
+# in sessions.db is unreliable, 99/138 workers measured dur=0).
+# Estimates are recorded to .orch/estimates.jsonl at spawn time so the
+# user can review "predicted vs actual" later via `orch weights`.
+
+DEVIN_DB = os.path.expanduser("~/.local/share/devin/cli/sessions.db")
+ORCA_DB = os.path.expanduser(
+    "~/Library/Application Support/orca/orchestration.db")
+SPEC_BUCKETS = (2000, 6000)
+ESTIMATES_FILE = os.path.join(STATE_DIR, "estimates.jsonl")
+
+
+def _ro_db(path):
+    return sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True)
+
+
+def _spec_len(task_id):
+    try:
+        r = _ro_db(ORCA_DB).execute(
+            "SELECT length(spec) FROM tasks WHERE id=?",
+            (task_id,)).fetchone()
+        return r[0] if r else 0
+    except Exception:
+        return 0
+
+
+def _session_task_map():
+    """devin session_id -> orca task_id, via the worker preamble."""
+    out = {}
+    try:
+        for sid, content in _ro_db(DEVIN_DB).execute(
+                "SELECT session_id, content FROM prompt_history"):
+            if "dispatched worker" not in (content or ""):
+                continue
+            m = re.search(r"task ID is: (\S+)", content)
+            if m and sid not in out:
+                out[sid] = m.group(1)
+    except Exception:
+        pass
+    return out
+
+
+_WM_CACHE = None
+
+
+def _worker_metrics(task_ids=None):
+    """task_id -> (model, spec_len, in_tok, out_tok, gen_ms) summed over
+    assistant metrics for that worker's devin session. Full scan is
+    ~10-20s, so the unfiltered result is cached per process."""
+    global _WM_CACHE
+    if _WM_CACHE is None:
+        _WM_CACHE = _worker_metrics_all()
+    if task_ids is None:
+        return _WM_CACHE
+    return {t: v for t, v in _WM_CACHE.items() if t in task_ids}
+
+
+def _worker_metrics_all():
+    tmap = _session_task_map()
+    if not tmap:
+        return {}
+    specs = {}
+    try:
+        for tid, ln in _ro_db(ORCA_DB).execute(
+                "SELECT id, length(spec) FROM tasks"):
+            specs[tid] = ln or 0
+    except Exception:
+        pass
+    models = {}
+    try:
+        for sid, mdl in _ro_db(DEVIN_DB).execute("SELECT id, model FROM sessions"):
+            models[sid] = mdl
+    except Exception:
+        pass
+    agg = {}
+    try:
+        for sid, cm in _ro_db(DEVIN_DB).execute(
+                "SELECT session_id, chat_message FROM message_nodes"):
+            tid = tmap.get(sid)
+            if not tid:
+                continue
+            try:
+                j = json.loads(cm)
+            except Exception:
+                continue
+            md = j.get("metadata") or {}
+            if j.get("role") != "assistant" or not md.get("metrics"):
+                continue
+            m = md["metrics"]
+            a = agg.setdefault(tid, [models.get(sid), specs.get(tid, 0),
+                                     0, 0, 0])
+            a[2] += m.get("input_tokens") or 0
+            a[3] += m.get("output_tokens") or 0
+            a[4] += m.get("total_time_ms") or 0
+    except Exception:
+        pass
+    return agg
+
+
+def _bucket(spec_len):
+    return (0 if spec_len < SPEC_BUCKETS[0]
+            else 1 if spec_len < SPEC_BUCKETS[1] else 2)
+
+
+def _median(vals):
+    vals = sorted(vals)
+    return vals[len(vals) // 2] if vals else 0
+
+
+def _estimate_weight(model, spec_len):
+    """Median-based estimate; falls back (model,bucket)->model->global."""
+    hist = collections.defaultdict(list)
+    for mdl, sl, inp, out, gen in _worker_metrics().values():
+        hist[("g",)].append((inp, out, gen))
+        hist[("m", mdl)].append((inp, out, gen))
+        hist[("mb", mdl, _bucket(sl))].append((inp, out, gen))
+    for key in (("mb", model, _bucket(spec_len)),
+                ("m", model), ("g",)):
+        v = hist.get(key)
+        if v:
+            return {"in_tok": _median(x[0] for x in v),
+                    "out_tok": _median(x[1] for x in v),
+                    "gen_min": round(_median(x[2] for x in v) / 60000),
+                    "n": len(v)}
+    return None
+
+
+def _record_estimate(run_id, task_id, name, model):
+    try:
+        est = _estimate_weight(model, _spec_len(task_id))
+        if not est:
+            return
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(ESTIMATES_FILE, "a") as f:
+            f.write(json.dumps({
+                "ts": int(time.time()), "run": run_id, "task": task_id,
+                "name": name, "model": model, "est": est},
+                ensure_ascii=False) + "\n")
+        print(f"orch: est for {name}: ~{est['in_tok']/1e6:.1f}M in / "
+              f"~{est['gen_min']}min gen (median of {est['n']} past workers)",
+              file=sys.stderr)
+    except Exception:
+        pass   # estimation is advisory; never block a spawn on it
+
+
+def _check_parallel_cap(st, need=1):
+    cap = _parallel_cap(st)
+    if cap <= 0:
+        return
+    live = _live_devin_count()
+    if live + need > cap:
+        raise ParallelCapReached(
+            f"parallel cap: {live} active devin sessions + {need} new "
+            f"> cap {cap} (idle >{_idle_min()}min sessions don't count). "
+            "The free-model rate limit is account-wide — "
+            "the 2026-09-18 incident killed all 30 concurrent workers at "
+            "once. Free slots with `orch collect` + `orch clean`, shrink "
+            "the request, or raise the cap via `orch boot --cap N` / "
+            "ORCH_PARALLEL_CAP env (0 = off)")
+
+
 def _spawn_rollback(wid, handle, branch):
     """Undo a half-spawn: close the terminal, force-rm the worktree, delete
     the branch. Measured incident: `worker-start failed` left one stale
@@ -264,6 +527,7 @@ def _spawn_one(run, tid, name, model, base, setup, repo, st, role="worker"):
     Any failure after the worktree exists rolls all created resources back."""
     model = _canonical_model(model)
     _check_model_allowed(model, st)
+    _check_parallel_cap(st)
     wid = branch = handle = None
     try:
         wargs = ["worktree", "create", "--name", name]
@@ -312,6 +576,7 @@ def _spawn_one(run, tid, name, model, base, setup, repo, st, role="worker"):
         run["dispatches"][did] = rec
         run["tasks"].setdefault(tid, {}).setdefault("dispatches", []).append(did)
         state_save(st)
+        _record_estimate(st.get("current_run"), tid, name, model)
         return rec
     except BaseException:
         _spawn_rollback(wid, handle, branch)
@@ -551,6 +816,8 @@ def cmd_compete(args):
         _check_model_allowed(m, st)
     spec = open(spec_file).read()
     _spec_gate_apply(_jev_spec_ambiguity(spec, args, st), models)
+    _check_parallel_cap(st, n)   # a compete is one candidate set —
+                                 # spawning a partial set is worse than none
     cluster = args.get("--cluster") or os.path.splitext(os.path.basename(spec_file))[0]
     recs = []
     for i in range(n):
@@ -565,6 +832,47 @@ def cmd_compete(args):
                          args.get("--repo"), st, role="candidate")
         recs.append(rec)
     print(json.dumps(recs, indent=1))
+
+
+def _item_spec_len(it):
+    if it.get("task"):
+        return _spec_len(it["task"])
+    sf = it.get("spec_file")
+    if sf and os.path.exists(sf):
+        return len(open(sf).read())
+    return 0
+
+
+def _item_est(it, defaults):
+    """(model, est) for a manifest item — used by --sort-weight and
+    `orch estimate` to order heavy tasks first (LPT)."""
+    model = (it.get("model") or defaults.get("model") or "swe-2-medium")
+    return model, _estimate_weight(model, _item_spec_len(it))
+
+
+def cmd_estimate(args):
+    """Preview weight estimates: `orch estimate manifest.json` or spec
+    files. Sorted heaviest-first — the order that minimizes makespan."""
+    files = args["_"]
+    if not files:
+        die("usage: orch estimate <manifest.json> | <spec-file>... [--model M]")
+    rows = []
+    if len(files) == 1 and files[0].endswith(".json"):
+        man = json.loads(open(files[0]).read())
+        defaults = man.get("defaults") or {}
+        for it in man.get("items") or []:
+            model, est = _item_est(it, defaults)
+            rows.append({"name": (it.get("name") or it.get("title")
+                                  or it.get("spec_file") or it.get("task")),
+                         "model": model,
+                         "spec_len": _item_spec_len(it), "est": est})
+    else:
+        model = args.get("--model") or "swe-2-high"
+        for f in files:
+            est = _estimate_weight(model, len(open(f).read()))
+            rows.append({"name": f, "model": model, "est": est})
+    rows.sort(key=lambda r: -((r["est"] or {}).get("gen_min", 0)))
+    print(json.dumps(rows, indent=1, ensure_ascii=False))
 
 
 def cmd_batch(args):
@@ -589,7 +897,8 @@ def cmd_batch(args):
     """
     files = args["_"]
     if not files:
-        die("usage: orch batch <manifest.json> [--gap-sec N] [--retries N]")
+        die("usage: orch batch <manifest.json> [--gap-sec N] [--retries N] "
+            "[--sort-weight]")
     man = json.loads(open(files[0]).read())
     items = man.get("items") or []
     if not items:
@@ -602,9 +911,25 @@ def cmd_batch(args):
     for it in items:
         _check_model_allowed(it.get("model") or defaults.get("model")
                              or "swe-2-medium", st)
+    if args.get("--sort-weight"):
+        # LPT: longest tasks first minimizes the makespan tail — the
+        # "integration waits for the slowest worker" failure mode
+        scored = []
+        for it in items:
+            model, est = _item_est(it, defaults)
+            scored.append(((est or {}).get("gen_min", 0), it))
+        scored.sort(key=lambda x: -x[0])
+        items = [it for _, it in scored]
+        for gm, it in scored:
+            print(f"orch: order {it.get('name') or it.get('title') or '?'}: "
+                  f"~{gm}min est", file=sys.stderr)
 
-    ok, failed = [], []
+    ok, failed, deferred = [], [], []
+    cap_hit = False
     for i, it in enumerate(items):
+        if cap_hit:
+            deferred.append(it)
+            continue
         if i:
             time.sleep(gap)   # pacing: back-to-back spawns triggered
                               # `worker-start failed: null` (rate limit?)
@@ -654,14 +979,45 @@ def cmd_batch(args):
                 failed.append({"name": name, "error": str(err)})
                 print(f"orch: spawn failed for {name}: {err}",
                       file=sys.stderr)
+        except ParallelCapReached as e:
+            # account quota cap: every remaining item would fail the same
+            # way — stop here and hand the leftover manifest back
+            cap_hit = True
+            deferred.append(it)
+            print(f"orch: {e}", file=sys.stderr)
         except Exception as e:
             failed.append({"name": it.get("name") or "?", "error": str(e)})
             print(f"orch: item failed: {e}", file=sys.stderr)
     state_save(st)
-    print(json.dumps({"spawned": ok, "failed": failed},
-                     indent=1, ensure_ascii=False))
+    out = {"spawned": ok, "failed": failed}
+    if deferred:
+        out["deferred"] = deferred
+        out["note"] = ("parallel cap reached mid-batch — clean finished "
+                       "workers (`orch collect`/`orch clean`) then re-run "
+                       "the deferred items as a new manifest")
+    print(json.dumps(out, indent=1, ensure_ascii=False))
+    if cap_hit:
+        sys.exit(3)
     if failed:
         sys.exit(2)
+
+
+def cmd_weights(args):
+    """Show recorded spawn estimates joined with actual worker metrics —
+    the reviewable 'predicted vs actual' log (.orch/estimates.jsonl)."""
+    if not os.path.exists(ESTIMATES_FILE):
+        die("no estimates yet — they are recorded at spawn time")
+    entries = [json.loads(l) for l in open(ESTIMATES_FILE) if l.strip()]
+    actual = _worker_metrics({e["task"] for e in entries if e.get("task")})
+    rows = []
+    for e in entries:
+        a = actual.get(e.get("task"))
+        r = dict(e)
+        if a:
+            r["actual"] = {"in_tok": a[2], "out_tok": a[3],
+                           "gen_min": round(a[4] / 60000)}
+        rows.append(r)
+    print(json.dumps(rows, indent=1, ensure_ascii=False))
 
 
 WAIT_TYPES = "worker_done,escalation,question"
@@ -1050,6 +1406,10 @@ def cmd_status(args):
                  check=False) or {}
     print(json.dumps({
         "run": rid, "objective": run["objective"],
+        "active_devin_sessions": _live_devin_count(),
+        "live_devin_processes": _live_devin_count_raw(),
+        "idle_min": _idle_min(),
+        "parallel_cap": _parallel_cap(st),
         "tasks": find_key(tasks, "tasks", tasks),
         "dispatches": [
             {"dispatch": k, "name": v["name"], "model": v["model"],
@@ -1085,13 +1445,19 @@ def cmd_boot(args):
     files = args["_"]
     if not files:
         die("usage: orch boot <requirement-file> [--allow swe-2-max] "
-            "[--jev] [--worktree sel]")
+            "[--jev] [--cap N] [--worktree sel]")
     if args.get("--model"):
         die("--model is gone: coordinator defaults to swe-2-high. "
             "Use --allow swe-2-max to run the coordinator and workers on max")
     allow = args.get("--allow")
     if allow and allow != "swe-2-max":
         die(f"unknown --allow value: {allow} (only swe-2-max is allow-able)")
+    cap = None
+    if args.get("--cap") is not None:
+        try:
+            cap = int(args["--cap"])
+        except ValueError:
+            die(f"bad --cap value: {args['--cap']} (int; 0 disables)")
     jev = bool(args.get("--jev"))
     req = os.path.abspath(files[0])
     obj = open(req).read().strip().splitlines()[0][:200]
@@ -1101,8 +1467,11 @@ def cmd_boot(args):
     st["runs"][rid] = {"objective": obj, "created_at": int(time.time()),
                      "tasks": {}, "dispatches": {}, "allow": allow,
                      "jev": jev}
+    if cap is not None:
+        st["runs"][rid]["parallel_cap"] = cap
     st["current_run"] = rid
     state_save(st)
+    _check_parallel_cap(st)
 
     # coordinator is swe-2-high by default; --allow swe-2-max upgrades the
     # coordinator itself to max AND lets workers use max. The allow is
@@ -1114,7 +1483,9 @@ def cmd_boot(args):
     # run sees Jev as opted-in even without the flag. Both env vars are
     # set explicitly — an empty value clears anything leaked from the
     # shell that ran `orch boot`.
+    eff_cap = _parallel_cap(st)
     cmd = (f"env ORCH_ALLOW={allow or ''} ORCH_JEV={'1' if jev else ''} "
+           f"ORCH_PARALLEL_CAP={eff_cap} "
            f"{DEVIN} --model {model} --permission-mode bypass")
     wt = _resolve_worktree(args)
     t = orca("terminal", "create", "--worktree", wt, "--title", "coordinator",
@@ -1128,11 +1499,17 @@ def cmd_boot(args):
         f"2. {playbook} を読み、要件ファイル {req} に対して実行する\n"
         f"3. ハーネスCLI: {HARNESS_DIR}/bin/orch (stateはこの端末のcwdの .orch/)\n"
         f"4. モデル上限: {'swe-2-max まで使用可 (allow は .orch/state.json に永続化済み・バックグラウンドシェルからでも有効)' if allow else 'swe-2-high まで。swe-2-max はこのRunでは禁止'}\n"
-        f"5. Jev: {'このRunは --jev 有効。`orch score` で候補を事前採点して上位だけ実物審査し、spawn/compete/batch/patrol/adopt の Jev 判定は state 永続化により自動で効く(TYPESAFE_API_KEY が無ければ各コマンドが非Jev経路にフォールバック)' if jev else '無効。使うなら spawn/compete/batch/patrol/adopt に --jev を付ける(要 TYPESAFE_API_KEY)'}"
+        f"5. Jev: {'このRunは --jev 有効。`orch score` で候補を事前採点して上位だけ実物審査し、spawn/compete/batch/patrol/adopt の Jev 判定は state 永続化により自動で効く(TYPESAFE_API_KEY が無ければ各コマンドが非Jev経路にフォールバック)' if jev else '無効。使うなら spawn/compete/batch/patrol/adopt に --jev を付ける(要 TYPESAFE_API_KEY)'}\n"
+        f"6. 並列上限: アクティブなdevinセッション {eff_cap} まで(アカウント共通quota対策・state永続化済み・{_idle_min()}分超idleはカウント除外)。"
+        f"cap到達で spawn/batch は拒否されるので、ワーカー完了後は `orch clean` で枠を解放してから次の波を投入する\n"
+        f"7. 重さ予測: spawn時に (model,spec長) 中央値ベースの予想トークン/生成時間が .orch/estimates.jsonl に記録される。"
+        f"`orch weights` で予測vs実績を見返せる — 過剰分解やモデル配分の判断材料にする。"
+        f"大量投入は `orch estimate` で予測を見て `orch batch --sort-weight` で重い順に投げる"
     )
     ok = _send_prompt_devin(handle, prompt)
     print(json.dumps({"run": rid, "coordinator_terminal": handle,
                       "allow": allow or "swe-2-high", "jev": jev,
+                      "parallel_cap": eff_cap,
                       "prompt_submitted": ok}, indent=1))
 
 
@@ -1153,6 +1530,8 @@ COMMANDS = {
     "integrate": cmd_integrate,
     "clean": cmd_clean,
     "status": cmd_status,
+    "weights": cmd_weights,
+    "estimate": cmd_estimate,
     "boot": cmd_boot,
 }
 
@@ -1189,4 +1568,7 @@ if __name__ == "__main__":
         print(__doc__)
         sys.exit(0)
     name, args = parse(sys.argv[1:])
-    COMMANDS[name](args)
+    try:
+        COMMANDS[name](args)
+    except ParallelCapReached as e:
+        die(str(e), code=3)

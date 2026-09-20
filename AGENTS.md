@@ -53,7 +53,10 @@ Orca の思想に合わせ、**スケジューラは作らない**。Run は名�
 | spawn されたが devin が起動していない zombie dispatch が status 上は生きて見える(数時間検出不能) | `orch patrol` が未開始stateの滞留を `zombie?` として報告 | bin/orch |
 | 未ackメッセージが `check --wait` で再配信され処理がループ | `orch wait` は処理メッセージを自動ack。playbookに生 check 使用時の ack 義務を明記 | bin/orch, playbook |
 | ワーカーが毎回 hook に複数回ブロックされ代替を再学習(23hで308ステップ) | hook 遵守・代替手段を仕様テンプレに定型句として注入 | tasks/template.md |
+| 30並列ワーカーが free model rate limit で全滅(3分で30s同時停止・復帰まで53分) | `_spawn_one` と `boot` がアクティブなdevinセッション数を cap(既定10)で機械的に拒否。`orch boot --cap N`/`ORCH_PARALLEL_CAP` で変更・0で無効。15分超idleのセッションはカウントしない(`ORCH_PARALLEL_IDLE_MIN`)。batch は cap 到達で残アイテムを deferred として返す(exit 3) | bin/orch |
 | coordinator が全候補を実物審査(1Runで eval 328回・screenshot 112回) | `orch score` — Jev(TypeSafe System One)で候補を投機的採点し上位だけ審査。採否自体は coordinator の判断のまま(advisory) | bin/orch |
+| タスクの重さ(トークン・時間)が事前に読めず過剰分解・配分ミスの判断材料がない | spawn時に (model,spec長) 中央値の予測を `.orch/estimates.jsonl` に記録。`orch weights` で予測vs実績を照合(sessions.db×orchestration.db結合・結合率136/138)。`orch estimate` で投入前プレビュー | bin/orch |
+| 統合が最遅ワーカー待ち(テールが長い) | `orch batch --sort-weight` — manifestを重さ予測降順(LPT)で投入。makespan最小化の古典ルール | bin/orch, playbook |
 
 ## 使い方
 
@@ -72,6 +75,9 @@ orch integrate --topic ui --branches b1,b2 --verify "npx tsc --noEmit"
 orch clean --losers                # 採否確定クラスタの敗者のみ削除(後続dispatchは巻き込まない)
 orch clean --cluster <name>        # クラスタごと放棄(adoptedは残る)
 orch status
+orch weights                       # spawn時の重さ予測 vs 実績(予測は .orch/estimates.jsonl に記録)
+orch estimate manifest.json        # 投入前に各itemの重さ予測を重い順でプレビュー
+orch batch m.json --sort-weight    # 重い順(LPT)に並べて投入 — makespanのテールを縮める
 ```
 
 全自動モード: `orch boot requirement.md` がコーディネーター端末
@@ -83,6 +89,11 @@ ORCH_ALLOW 環境変数は後方互換の補助経路 — background shell に�
 実測があるため state 永続化が本経路)。
 `--jev` を付けるとこのRun全体で Jev 連携が有効化され(下記「実験」節)、
 coordinator の prompt に使い方が注入される。
+`--cap N` を付けるとこのRunの並列上限(devinセッション数)を変更する
+(既定10・state.json に永続化・0で無効。アカウント共通の free model
+rate limit 対策 — 30並列で全滅した実測がある)。
+カウント対象は「直近 `ORCH_PARALLEL_IDLE_MIN` 分(既定15)に活動した
+セッション」のみ — 数日idleの残置セッションは枠を食わない。
 人間は要件投入と最終マージ承認だけ。
 
 ## 実験: Jev 連携(意味判定の安い層)
