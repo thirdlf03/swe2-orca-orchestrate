@@ -98,7 +98,7 @@ tier 3つ(medium/high/max)の存在、`screen.*` の正規表現のコンパイ�
 - `claude:high` — claude の high tier(= opus)
 - `high` — 既定エージェントの high。既定は `--agent` > `ORCH_AGENT` > run state(`orch boot --agent`)> devin
 - `swe-2-high` — `models.known` にある id は agent を逆引き(→ devin)。後方互換
-- `codex:gpt-5.6-luna` — agent 付きなら known に無い id もそのまま渡る(tier は tiers の model と一致すれば付く)
+- `codex:gpt-6-luna` — model id の直接指定。agent 付きなら known に無い id もそのまま渡る(tier は tiers の model と一致すれば付く。effort は付かない)
 - 空 — 既定エージェントの `default_tier`
 
 `spawn/compete/integrate/agents --check` の `--agent X` と、manifest の
@@ -206,6 +206,7 @@ codex の tier が既に古かった)。アダプタを書く・直すときは�
 | その他 | 各 CLI の models コマンドか公式ドキュメント |
 
 - tier にはできるだけ**エイリアス**(常に最新を指す名前)を使う。claude はそうしている
+- 世代が新しいモデルがあれば全 tier をそれに揃え、tier の差は effort で付ける(codex は medium/high/max とも `gpt-6-luna`)。ローカル設定ファイルの既定モデルは古いことがあるので根拠にしない
 - `models.list_source` を書いておくと、`orch agents` がその一覧と tier を突き合わせ、
   一覧から消えたモデルを `stale_models`(例: `high=gpt-5.5`)として出す。
   一覧が取れない環境では `models_checked: false` になるだけで止まらない

@@ -37,7 +37,7 @@
   "default_tier": "medium",
   "tiers": {
    "medium": {
-    "model": "gpt-5.6-terra",
+    "model": "gpt-6-luna",
     "effort": "medium"
    },
    "high": {
@@ -67,7 +67,7 @@
     "visibility": "hide"
    }
   },
-  "_note": "tier は ~/.codex/models_cache.json(2026-10-17 取得)の visibility=list のモデルに合わせた。モデルは頻繁に入れ替わるので更新時は `orch agents` の stale_models と `codex debug models` / 公式ドキュメントで最新を確認する"
+  "_note": "tier は全て最新の gpt-6-luna(~/.codex/models_cache.json で priority 最上位・2026-10-17 取得)に揃え、差は effort で付ける。旧世代(gpt-5.6-*)は known に残すが tier には使わない。config.toml の既定モデルは古いことがあるので根拠にしない。更新時は `orch agents` の stale_models と `codex debug models` / 公式ドキュメントで最新を確認する"
  },
  "screen": {
   "ready": "ask codex to do anything|›\\s*$",

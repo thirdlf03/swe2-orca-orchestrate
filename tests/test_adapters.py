@@ -156,16 +156,17 @@ class ModelFreshnessTest(unittest.TestCase):
 
     def test_stale_detected(self):
         a = self._codex_with_cache([{"slug": "gpt-6-luna",
-                                     "visibility": "list"},
+                                     "visibility": "hide"},
                                     {"slug": "gpt-5.6-terra",
-                                     "visibility": "hide"}])
+                                     "visibility": "list"}])
         avail = A.available_models(a)
-        self.assertEqual(avail, ["gpt-6-luna"])
-        self.assertEqual(A.stale_models(a, avail), ["medium=gpt-5.6-terra"])
+        self.assertEqual(avail, ["gpt-5.6-terra"])
+        self.assertEqual(A.stale_models(a, avail),
+                         ["medium=gpt-6-luna", "high=gpt-6-luna",
+                          "max=gpt-6-luna"])
 
     def test_fresh_and_unreadable(self):
-        a = self._codex_with_cache([{"slug": "gpt-6-luna"},
-                                    {"slug": "gpt-5.6-terra"}])
+        a = self._codex_with_cache([{"slug": "gpt-6-luna"}])
         self.assertEqual(A.stale_models(a, A.available_models(a)), [])
         a["models"]["list_source"]["json"] = ["/nonexistent/x.json"]
         self.assertIsNone(A.available_models(a))
