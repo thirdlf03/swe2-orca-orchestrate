@@ -1,0 +1,108 @@
+{
+ "id": "claude",
+ "description": "Claude Code (Anthropic)",
+ "provider": "anthropic",
+ "binary": "claude",
+ "binary_env": "ORCH_CLAUDE_CMD",
+ "process_names": [
+  "claude"
+ ],
+ "liveness": "ps",
+ "activity_globs": [
+  "~/.claude/projects/*/*.jsonl"
+ ],
+ "launch": {
+  "argv": [
+   "{binary}",
+   "{model_args}",
+   "{effort_args}",
+   "{bypass}",
+   "{hook_args}"
+  ],
+  "bypass": [
+   "--dangerously-skip-permissions"
+  ],
+  "model_args": [
+   "--model",
+   "{model}"
+  ],
+  "effort_args": [
+   "--effort",
+   "{effort}"
+  ],
+  "env": {}
+ },
+ "models": {
+  "default_tier": "medium",
+  "tiers": {
+   "medium": {
+    "model": "sonnet"
+   },
+   "high": {
+    "model": "opus"
+   },
+   "max": {
+    "model": "fable",
+    "effort": "max"
+   }
+  },
+  "known": [
+   "sonnet",
+   "opus",
+   "haiku",
+   "fable",
+   "claude-sonnet-5-5",
+   "claude-opus-5-5",
+   "claude-haiku-5-5",
+   "claude-fable-5-1"
+  ],
+  "gated_models": [
+   "fable",
+   "claude-fable-5-1"
+  ],
+  "fuzzy": false,
+  "_note": "tier は CLI のエイリアス(sonnet/opus/fable)で指定し、エイリアスが常に最新モデルを指すようにしている。フル ID を使う場合は `claude --help` / 公式ドキュメントで最新を確認する"
+ },
+ "screen": {
+  "ready": "\\? for shortcuts|bypass permissions on",
+  "input_echo": "^[>❯]\\s*{first}",
+  "pending_paste": "\\[Pasted text #\\d+",
+  "approval": "Do you want to proceed\\?|Do you want to make this edit",
+  "approval_answer": "don't ask again|always",
+  "rate_limit": "usage limit reached|limit reached\\s*[∙·]\\s*resets|rate_limit_error|Overloaded",
+  "startup_prompts": [
+   {
+    "match": "Do you trust the files in this folder|trust this folder",
+    "keys": [
+     "enter"
+    ]
+   },
+   {
+    "match": "Bypass Permissions mode[\\s\\S]*Yes, I accept",
+    "keys": [
+     "2",
+     "enter"
+    ]
+   }
+  ]
+ },
+ "readiness": {
+  "strategy": "screen-regex",
+  "timeout_s": 120
+ },
+ "resume_text": "continue — 中断した作業を再開し、ライフサイクル義務(heartbeat / worker_done)を守ること",
+ "transcript": {
+  "reader": "claude_projects"
+ },
+ "hooks": {
+  "installer": "launch-args"
+ },
+ "spec_notes": "- シェル操作は Bash ツール、ファイル操作は Read/Edit/Write ツールを使う\n- hook にブロックされたら、ブロック理由に書かれた代替手段をそのまま使う",
+ "verified": {
+  "launch": true,
+  "ready": "orca-screen-rule",
+  "approval": false,
+  "rate_limit": false,
+  "hooks": true
+ }
+}

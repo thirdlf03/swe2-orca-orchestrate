@@ -23,8 +23,30 @@ Policy:
     segment piped into a shell) still count — a quoted blind wait is
     still a blind wait.
 
-On block, prints a JSON decision + reason on stdout and the reason on
-stderr, then exits 2 (covers both JSON-decision and exit-code semantics).
+Input shapes (one policy, several agent CLIs — the harness spawns devin,
+claude, codex and opencode workers, and a per-agent copy of the policy
+would drift):
+  devin     {"tool_name": "exec"|"write_to_process",
+             "tool_input": {"command"|"text_input"|"bytes_input": str}}
+  claude    {"hook_event_name": "PreToolUse", "tool_name": "Bash",
+             "tool_input": {"command": str}}
+  codex     Claude-compatible shape assumed (schema UNVERIFIED), plus a
+            top-level "command" str|argv list; argv lists are joined
+            (`["bash","-lc","<script>"]` -> the script)
+  opencode  {"tool": "bash", "args": {"command": str}} — sent on stdin by the
+            hooks/opencode/orch-no-blind-sleep.js plugin wrapper
+
+Output: `--agent <id>` picks the format, default auto-detect from the input.
+On block, always: reason on stderr + exit 2 (the exit-code contract every
+CLI above honours). stdout JSON per agent:
+  devin / opencode  {"decision": "block", "reason": ...}   (verified shape)
+  claude / codex / unknown  the above PLUS
+    {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+      "permissionDecision": "deny", "permissionDecisionReason": ...}}
+    — Claude Code deprecated top-level decision:block in favour of
+    permissionDecision; emitting both satisfies old and new readers.
+Unparseable input / no command -> allow (exit 0, silent): a hook bug must
+never wedge an unattended worker.
 """
 import json
 import re
@@ -55,6 +77,8 @@ Wait on a CONDITION instead:
   ssh <host> 'until <remote-check>; do sleep 30; done'   # push the wait remote-side
   npx wait-on tcp:<port>                        # dev-server readiness
   wait-for '<check-cmd>' [--interval N] [--timeout N]   # ~/.local/bin/wait-for
+  orch wait --timeout-min 60                    # coordinator: event-driven completion
+These are plain shell commands — run them from whatever shell tool your agent has.
 Rule: sleep is only allowed as the interval INSIDE an until/while loop —
 or inside a `for` loop that can early-exit via break/exit/return."""
 
@@ -156,17 +180,56 @@ def in_condition_loop(cmd: str, pos: int, shell: bool = True) -> bool:
     return True
 
 
-def main() -> None:
-    try:
-        data = json.load(sys.stdin)
-    except Exception:
-        return
-    ti = data.get("tool_input") or {}
-    cmd = ti.get("command") or ti.get("text_input") or ti.get("bytes_input") or ""
-    if not cmd:
-        return
-    cmd = strip_heredocs(cmd)
+AGENTS = ("devin", "claude", "codex", "opencode")
+DEVIN_TOOLS = ("exec", "write_to_process")
+SHELL_C_RE = re.compile(r"^-[a-zA-Z]*c$")
 
+
+def _as_text(v) -> str:
+    """Normalise a command field. Codex-style argv lists
+    (`["bash", "-lc", "<script>"]`) yield the script; other lists are joined."""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, (list, tuple)) and all(isinstance(x, str) for x in v):
+        if len(v) >= 3 and SHELL_C_RE.match(v[-2]):
+            return v[-1]
+        return " ".join(v)
+    return ""
+
+
+def extract_command(data) -> str:
+    """Pull the shell text out of any supported agent's hook payload."""
+    if not isinstance(data, dict):
+        return ""
+    for key in ("tool_input", "args", "input"):
+        ti = data.get(key)
+        if isinstance(ti, dict):
+            for f in ("command", "text_input", "bytes_input", "cmd"):
+                t = _as_text(ti.get(f))
+                if t:
+                    return t
+    return _as_text(data.get("command")) or _as_text(data.get("cmd"))
+
+
+def detect_agent(data) -> str:
+    """Best-effort agent id from the payload shape ("" = unknown)."""
+    if not isinstance(data, dict):
+        return ""
+    tool = data.get("tool_name")
+    if tool in DEVIN_TOOLS:
+        return "devin"
+    if tool == "Bash":
+        return "claude"
+    if "tool" in data and isinstance(data.get("args"), dict):
+        return "opencode"
+    if "command" in data and "tool_input" not in data:
+        return "codex"
+    return ""
+
+
+def find_blind_sleeps(cmd: str) -> list:
+    """Durations (s) of sleeps that violate the policy; [] = allow."""
+    cmd = strip_heredocs(cmd)
     bad = []
     matches = [
         (m.start(), float(m.group(1)) * UNIT.get(m.group(2) or "s", 1), True)
@@ -186,12 +249,48 @@ def main() -> None:
             stripped = re.sub(r"[;&|]|&&|\|\|", " ", stripped).strip()
             if not stripped:
                 bad.append(n)
+    return bad
 
+
+def block_payload(agent: str, reason: str) -> dict:
+    """stdout JSON for a block. devin/opencode keep the verified legacy
+    shape; everything else also gets Claude's hookSpecificOutput deny."""
+    out = {"decision": "block", "reason": reason}
+    if agent not in ("devin", "opencode"):
+        out["hookSpecificOutput"] = {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    return out
+
+
+def _parse_agent(argv) -> str:
+    for i, a in enumerate(argv):
+        if a == "--agent" and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith("--agent="):
+            return a.split("=", 1)[1]
+    return ""
+
+
+def main(argv=None) -> None:
+    argv = sys.argv[1:] if argv is None else argv
+    try:
+        data = json.load(sys.stdin)
+    except Exception:
+        return
+    cmd = extract_command(data)
+    if not cmd:
+        return
+    bad = find_blind_sleeps(cmd)
     if bad:
+        agent = _parse_agent(argv) or detect_agent(data)
         reason = REASON.format(n=int(max(bad)))
-        sys.stdout.write(json.dumps({"decision": "block", "reason": reason}) + "\n")
+        sys.stdout.write(json.dumps(block_payload(agent, reason)) + "\n")
         sys.stderr.write(reason + "\n")
         sys.exit(2)
 
 
-main()
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,32 @@
+{
+ "id": "generic",
+ "description": "Orca が知らない CLI 用の雛形。ORCH_GENERIC_CMD で起動コマンドを丸ごと指定する(バイパスフラグも含めること)。コピーして .orch/adapters/<id>.json に置けば独自アダプタになる",
+ "provider": "generic",
+ "binary": "sh",
+ "binary_env": "ORCH_GENERIC_CMD",
+ "process_names": [],
+ "liveness": "none",
+ "launch": {
+  "argv": ["{binary}"],
+  "bypass": [],
+  "model_args": [],
+  "effort_args": [],
+  "env": {}
+ },
+ "models": {"default_tier": "medium", "tiers": {"medium": {}, "high": {}, "max": {}}, "known": [], "gated_models": [], "fuzzy": false},
+ "screen": {
+  "ready": "",
+  "input_echo": "",
+  "pending_paste": "\\[Pasted text",
+  "approval": "permission required|allow once|allow always|Do you want to proceed",
+  "approval_answer": "always|bypass",
+  "rate_limit": "rate limit|usage limit|429",
+  "startup_prompts": []
+ },
+ "readiness": {"strategy": "orca-tui-idle", "timeout_s": 120},
+ "resume_text": "continue",
+ "transcript": {"reader": null},
+ "hooks": {"installer": null},
+ "spec_notes": "",
+ "verified": {}
+}

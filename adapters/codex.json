@@ -1,0 +1,111 @@
+{
+ "id": "codex",
+ "description": "OpenAI Codex CLI",
+ "provider": "openai",
+ "binary": "codex",
+ "binary_env": "ORCH_CODEX_CMD",
+ "process_names": [
+  "codex"
+ ],
+ "liveness": "ps",
+ "activity_globs": [
+  "~/.codex/sessions/*/*/*/rollout-*.jsonl",
+  "~/Library/Application Support/orca/codex-runtime-home/home/sessions/*/*/*/rollout-*.jsonl"
+ ],
+ "launch": {
+  "argv": [
+   "{binary}",
+   "{model_args}",
+   "{effort_args}",
+   "{bypass}",
+   "{hook_args}"
+  ],
+  "bypass": [
+   "--dangerously-bypass-approvals-and-sandbox"
+  ],
+  "model_args": [
+   "-m",
+   "{model}"
+  ],
+  "effort_args": [
+   "-c",
+   "model_reasoning_effort={effort}"
+  ],
+  "env": {}
+ },
+ "models": {
+  "default_tier": "medium",
+  "tiers": {
+   "medium": {
+    "model": "gpt-6-luna",
+    "effort": "medium"
+   },
+   "high": {
+    "model": "gpt-6-luna",
+    "effort": "high"
+   },
+   "max": {
+    "model": "gpt-6-luna",
+    "effort": "max"
+   }
+  },
+  "known": [
+   "gpt-6-luna"
+  ],
+  "gated_models": [],
+  "fuzzy": false,
+  "list_source": {
+   "json": [
+    "$CODEX_HOME/models_cache.json",
+    "~/.codex/models_cache.json"
+   ],
+   "key": "models",
+   "field": "slug",
+   "skip_if": {
+    "visibility": "hide"
+   }
+  },
+  "_note": "tier は全て最新の gpt-6-luna(~/.codex/models_cache.json で priority 最上位・2026-10-17 取得)に揃え、差は effort で付ける。旧世代は known にも残さない(直接指定したいときは `codex:<id>` と agent を付ければ known 外でも渡る)。config.toml の既定モデルは古いことがあるので根拠にしない。更新時は `orch agents` の stale_models と `codex debug models` / 公式ドキュメントで最新を確認する"
+ },
+ "screen": {
+  "ready": "ask codex to do anything|›\\s*$",
+  "input_echo": "^›\\s*{first}",
+  "pending_paste": "\\[Pasted text #\\d+|\\[Pasted Content",
+  "approval": "Would you like to (run the following command|make the following edits|grant these permissions)\\?",
+  "approval_answer": "don't ask again|always|this session",
+  "rate_limit": "usage limit|rate limit reached|Upgrade to (Plus|Pro)",
+  "startup_prompts": [
+   {
+    "match": "codex just got an upgrade|press enter to continue",
+    "keys": [
+     "enter"
+    ]
+   },
+   {
+    "match": "allow Codex to work in this folder|Do you trust",
+    "keys": [
+     "enter"
+    ]
+   }
+  ]
+ },
+ "readiness": {
+  "strategy": "both",
+  "timeout_s": 120
+ },
+ "resume_text": "continue — 中断した作業を再開し、ライフサイクル義務(heartbeat / worker_done)を守ること",
+ "transcript": {
+  "reader": "codex_rollout"
+ },
+ "hooks": {
+  "installer": "codex-hooks-json"
+ },
+ "spec_notes": "- sandbox はバイパス済み(orca CLI の unix socket に届く必要がある)\n- hook にブロックされたら、ブロック理由に書かれた代替手段をそのまま使う",
+ "verified": {
+  "launch": "orca-table",
+  "ready": "orca-predicate",
+  "approval": true,
+  "rate_limit": false,
+  "hooks": false
+ }
+}

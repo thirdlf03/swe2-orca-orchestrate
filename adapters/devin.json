@@ -1,0 +1,94 @@
+{
+ "id": "devin",
+ "description": "Devin CLI (SWE-2). 現行ハーネスの挙動をそのまま移植した基準アダプタ",
+ "provider": "cognition",
+ "binary": "devin",
+ "binary_env": "ORCH_DEVIN_CMD",
+ "process_names": [
+  "devin"
+ ],
+ "liveness": "devin_locks",
+ "launch": {
+  "argv": [
+   "{binary}",
+   "{model_args}",
+   "{bypass}",
+   "{hook_args}"
+  ],
+  "bypass": [
+   "--permission-mode",
+   "bypass"
+  ],
+  "model_args": [
+   "--model",
+   "{model}"
+  ],
+  "effort_args": [],
+  "env": {}
+ },
+ "models": {
+  "default_tier": "medium",
+  "tiers": {
+   "medium": {
+    "model": "swe-2-medium"
+   },
+   "high": {
+    "model": "swe-2-high"
+   },
+   "max": {
+    "model": "swe-2-max"
+   }
+  },
+  "known": [
+   "swe-2-medium",
+   "swe-2-high",
+   "swe-2-max",
+   "claude-opus-5-max",
+   "swe-1-7",
+   "swe-1-7-lightning"
+  ],
+  "gated_models": [
+   "swe-2-max",
+   "claude-opus-5-max",
+   "swe-1-7",
+   "swe-1-7-lightning"
+  ],
+  "fuzzy": true,
+  "_note": "devin の --model は部分一致で解決されるため、gated_models のいずれかの接頭辞や 'max' を含む指定は全て max 扱いで gate する(swe-1-7 系は名前に max が無いが Max tier)",
+  "list_source": {
+   "cmd": [
+    "devin",
+    "models",
+    "list"
+   ]
+  }
+ },
+ "screen": {
+  "ready": "SWE-2\\s+(Medium|High|Max)|Use /clear|Guide Devin",
+  "input_echo": "❭\\s*{first}",
+  "pending_paste": "\\[Pasted text #\\d+",
+  "approval": "\\(Approve once\\)|switch to bypass mode|Auto-approve all tools",
+  "approval_answer": "bypass",
+  "rate_limit": "Reached free model rate limit|rate limit",
+  "startup_prompts": []
+ },
+ "readiness": {
+  "strategy": "screen-regex",
+  "timeout_s": 180
+ },
+ "resume_text": "続けてください。中断した作業を再開し、ライフサイクル義務(heartbeat / worker_done)を守ること",
+ "transcript": {
+  "reader": "devin_sessions_db"
+ },
+ "hooks": {
+  "installer": "global-config"
+ },
+ "spec_notes": "- シェル操作は exec ツールで行う。`cd DIR && cmd` はブロックされるので exec の `workdir` パラメータを使う\n- ファイル操作は専用 read/edit/write ツールを使う(shell 経由の cat/sed 書き込みは hook でブロックされる)",
+ "verified": {
+  "launch": true,
+  "ready": true,
+  "approval": true,
+  "rate_limit": true,
+  "hooks": true
+ }
+}

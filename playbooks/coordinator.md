@@ -6,6 +6,13 @@
 道具は `orch` CLI(このrepoの `bin/orch`)。内部的には orca CLI を叩く。
 判断(分解・採否・マージ可否)はあなたの仕事。機械的な待機・巡回・掃除は
 `orch` と `patrol` に任せ、sleep で時間を潰さない。
+**生の `orca orchestration worker-start` は呼ばない** — ワーカーは必ず
+`orch spawn/compete/batch/integrate` で起動する(bypass フラグ・ロールバック・
+並列 cap・max gate・エージェント別注意の注入・イベント記録が全てここに入っている)。
+
+ワーカーのエージェントは混ぜてよい。モデル指定子は `[<agent>:]<tier|model-id>`
+(tier = medium / high / max。例 `claude:high`・`codex:medium`・`devin:medium`)。
+agent を省くと Run の既定エージェント。手元で使えるものと tier→モデル対応は `orch agents`。
 
 ## 0. 原則
 
@@ -23,25 +30,31 @@
 | 項目 | 判断基準 |
 |---|---|
 | コンペ数 n | 機械的/明確な仕様: 1。通常: 3。創造・曖昧・高リスク: 3〜5 |
-| モデル | 機械的: mediumのみ。通常: high×1+medium×残り。創造/曖昧/分析: high中心。**maxは boot --allow されたRunでのみ使える**(許可は .orch/state.json に永続化済み。無許可なら orch が機械的に拒否するので、そのまま渡して判定に任せてよい) |
+| tier / エージェント | 機械的: mediumのみ。通常: high×1+medium×残り。創造/曖昧/分析: high中心。**maxは boot --allow されたRunでのみ使える**(許可は .orch/state.json に永続化済み。無許可なら orch が機械的に拒否するので、そのまま渡して判定に任せてよい)。エージェントは provider を混ぜる(下記) |
 | write_scope | 触ってよい範囲。クラスタ間で非交差にする |
 | verify | 機械的に判定できる成功条件(型・テスト・ビルド)を必ず書く |
 | deps | 先行タスクの task id。無ければ並列 |
 
-判断の目安(swe2 実測特性由来):
-- **medium は曖昧な仕様を確認せず進む傾向** → 仕様が明確な時だけ使う
+判断の目安(実測特性由来):
+- **medium tier は曖昧な仕様を確認せず進む傾向** → 仕様が明確な時だけ使う
 - **high/max は仕様バグ自体を検出する** → 曖昧・矛盾を含みうる仕事は high 以上
-- **max の可否は orch が機械的に判定する**。`orch boot --allow swe-2-max`
-  されたRunでは許可が .orch/state.json に永続化されているので、
-  環境変数を気にせずそのまま `--model swe-2-max` を渡せばよい
-  (バックグラウンドシェルに環境変数が届かない問題は state 永続化で解決済み)
+- **max の可否は orch が機械的に判定する**。`orch boot --allow <agent>:max`
+  (全エージェントなら `--allow max`)されたRunでは許可が .orch/state.json に
+  永続化されているので、環境変数を気にせずそのまま `--model claude:max` 等を渡せばよい
 - 同一モデル×同じ入力の複製は誤りが相関する → コンペでは「作らせるもの」を少し変える
-  (別アプローチ指定等)か、モデルを混ぜる
+  (別アプローチ指定等)か、**エージェント/モデルを混ぜる**
+- **rate limit は provider アカウント単位**(並列 cap も provider ごと)。
+  同じ波に anthropic / openai / cognition 等を混ぜると上限に当たりにくい
 
 ## 2. 仕様ファイル
 
 `tasks/` に `<cluster>-<n>.md` で書く。`tasks/template.md` の契約欄は全文残す
 (heartbeat/ask/escalation/コミット義務/削除同意は実績上「書かないと守られない」)。
+エージェント固有の注意(ツール名・hook の代替手段)は書かなくてよい —
+`orch compete` / `orch batch`(spec_file 指定)/ `orch integrate` が各アダプタの
+`spec_notes` を spec 末尾に自動で足す。`orch task create` → `orch spawn` 経路は
+task 作成時点でエージェントが決まらないので、`orch task create spec.md --agent claude`
+のように `--agent` を付けるとその注意が足される。
 
 ## 3. 投入
 
@@ -49,8 +62,9 @@
 orch run create "<目的>"                      # Run作成(最初の1回)
 orch task create tasks/foo.md                 # 単発タスク
 orch compete tasks/bar.md -n 3 \
-  --models swe-2-high,swe-2-medium,swe-2-medium --cluster bar
-orch spawn --task <id> --name w-x --model swe-2-medium   # 個別
+  --models claude:high,codex:medium,devin:medium --cluster bar
+orch spawn --task <id> --name w-x --model codex:medium   # 個別
+orch agents --check claude:high               # 起動コマンドの事前確認(起動しない)
 orch batch manifest.json                      # 大量投入はこれ(下記)
 ```
 
@@ -63,10 +77,10 @@ orch batch manifest.json                      # 大量投入はこれ(下記)
 
 ```json
 {"cluster": "works",
- "defaults": {"model": "swe-2-medium"},
+ "defaults": {"model": "medium", "agent": "claude"},
  "items": [
-   {"spec_file": "tasks/w01.md", "name": "w01-a", "model": "swe-2-high"},
-   {"spec_file": "tasks/w01.md", "name": "w01-b"},
+   {"spec_file": "tasks/w01.md", "name": "w01-a", "model": "claude:high"},
+   {"spec_file": "tasks/w01.md", "name": "w01-b", "model": "codex:medium"},
    {"task": "task_abc", "name": "w-retry"}
  ]}
 ```
@@ -76,12 +90,13 @@ orch batch manifest.json                      # 大量投入はこれ(下記)
 結果は `{"spawned": [...], "failed": [...]}` で返り、failed があれば
 exit 2 で終わるので補完投入の判断材料にする。
 
-**並列上限cap(既定10)**: アクティブなdevinセッション数(15分超idleは除外)が cap に達すると
-spawn/compete/batch/integrate は機械的に拒否される
-(free model rate limit はアカウント共通 — 30並列で全滅した実測)。
+**並列上限cap(provider ごと・既定10)**: provider ごとのアクティブなセッション数
+(マシン全体。15分超idleは除外)が cap に達すると spawn/compete/batch/integrate は
+機械的に拒否される(rate limit は provider アカウント共通 — 30並列で全滅した実測)。
 cap 到達で batch は残アイテムを `deferred` として返す(exit 3)。
 ワーカー完了後は `orch clean` で枠を解放してから次の波を投入する。
-波のサイズは「cap − 現在の生存数」で決める(`orch status` が両方出す)。
+波のサイズは provider ごとに「cap − 現在の生存数」で決める(`orch status` の
+`providers` が両方出す)。片方の provider が詰まったら別 provider のエージェントに回す。
 
 **投入順**: `--sort-weight` を付けると manifest を重さ予測の降順
 (LPT)で並べて投入する — 重いタスクほど早く始める方が「統合が最遅
@@ -95,24 +110,30 @@ cap 到達で batch は残アイテムを `deferred` として返す(exit 3)。
 
 ```bash
 orch wait --timeout-min 60            # イベント駆動。worker_done/escalation/question が流れる
-orch patrol                           # 全dispatch巡回: 承認メニュー停止・長時間生存を検出
-orch patrol --rescue                  # 承認メニューを検出したら自動でキー送信して救出
+orch patrol                           # 全dispatch巡回: 承認メニュー・起動ゲート・rate limit・長時間生存を検出
+orch patrol --rescue                  # 承認メニュー/起動ゲートにキー送信、rate limit は cooldown 後に再開
 ```
 
-- `orch wait` は `check --wait --types ...` ベースで、処理した
-  メッセージを自動 ack する。**sleep ポーリング禁止**
-- 生の `orca orchestration check --wait` を直接使う場合、処理した
+- 待機は **`orch wait` だけ**。`check --wait --types ...` ベースで、処理した
+  メッセージを自動 ack し、worker_done を `.orch/events.jsonl` に記録する。
+  **sleep ポーリング禁止**
+- 例外的に生の `orca orchestration check --wait` を使った場合、処理した
   メッセージは必ず `orca orchestration ack --id <msg>` する —
   ack しないと同じメッセージが再配信されて何度も処理することになる(実測)
+- **rate limit**: patrol が画面で検出すると `rate-limited` を報告し、その provider の
+  cap を半減して state に永続化する(次の spawn/batch は自動で控えめになる)。
+  `orch patrol --rescue` は `--cooldown-min`(既定10)経過後にアダプタの再開文を送る。
+  人間や自分が手で「continue」を打って回らない
 - `question` が来たら `orca orchestration reply --id <msg> --body "<回答>"`
 - `escalation` が来たら内容を読んで対処(仕様修正・リトライ・人間に聞く)
 - patrol が `zombie?` を報告したら spawn 失敗の残骸 —
-  prompt injection が無言で失敗して devin が起動していない実測がある。
+  prompt injection が無言で失敗してエージェントが作業を始めていない実測がある。
   `orch clean --dispatch <id>` で掃除して再投入する
 - Jev 有効 Run では patrol が画面内容の意味判定も行う(`jev-stuck:p=`)。
   ヒューリスティックの誤検知を減らせる。Jev は `boot --jev` で Run 単位に
   有効化される(個別コマンドの --jev でも可)
-- heartbeat が一定時間無い/端末が沈黙 → patrol で `terminal read` して状態確認
+- heartbeat は補助(送らないワーカーが2〜3割いる実測)。死活は patrol の判定
+  (Orca の agentWait → 画面 → 経過時間)を見る。気になれば `terminal read` で確認
 - 15〜60分の無言は正常(コーディングタスクの常態)。timeout≠失敗
 
 ## 5. 審査(実物判定)

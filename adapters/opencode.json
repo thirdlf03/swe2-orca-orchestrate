@@ -1,0 +1,73 @@
+{
+ "id": "opencode",
+ "description": "OpenCode (TUI には --model が無いので tier はモデルを変えない。モデルは opencode.json の設定に従う)",
+ "provider": "opencode",
+ "binary": "opencode",
+ "binary_env": "ORCH_OPENCODE_CMD",
+ "process_names": [
+  "opencode"
+ ],
+ "liveness": "ps",
+ "activity_globs": [
+  "~/.local/share/opencode/opencode.db-wal",
+  "~/.local/share/opencode/opencode.db"
+ ],
+ "launch": {
+  "argv": [
+   "{binary}",
+   "{bypass}",
+   "{hook_args}"
+  ],
+  "bypass": [
+   "--auto"
+  ],
+  "model_args": [],
+  "effort_args": [],
+  "env": {}
+ },
+ "models": {
+  "default_tier": "medium",
+  "tiers": {
+   "medium": {},
+   "high": {},
+   "max": {}
+  },
+  "known": [],
+  "gated_models": [],
+  "fuzzy": false,
+  "list_source": {
+   "cmd": [
+    "opencode",
+    "models"
+   ]
+  }
+ },
+ "screen": {
+  "ready": "ctrl\\+p|tab\\s+agents?|Build\\s",
+  "input_echo": "",
+  "pending_paste": "\\[Pasted",
+  "approval": "permission required|allow once|allow always",
+  "approval_answer": "allow always|always",
+  "rate_limit": "rate limit|usage limit|429",
+  "startup_prompts": []
+ },
+ "readiness": {
+  "strategy": "both",
+  "timeout_s": 120
+ },
+ "resume_text": "continue — 中断した作業を再開し、ライフサイクル義務(heartbeat / worker_done)を守ること",
+ "transcript": {
+  "reader": "opencode_sqlite"
+ },
+ "hooks": {
+  "installer": "opencode-plugin"
+ },
+ "spec_notes": "- シェル操作は bash ツールを使う\n- hook にブロックされたら、ブロック理由に書かれた代替手段をそのまま使う",
+ "verified": {
+  "launch": true,
+  "ready": false,
+  "approval": false,
+  "rate_limit": false,
+  "hooks": false
+ }
+}

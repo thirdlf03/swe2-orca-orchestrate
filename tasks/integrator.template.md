@@ -21,8 +21,9 @@
 - **main に直接触らない**。`integ/` ブランチまでが担当範囲
 - 他の worktree のファイルを直接編集しない(読むのは可)
 - 迷ったら `ask`、ブロックなら `escalation`、5分毎に `heartbeat`
+  (いずれも `orca orchestration ...` のシェルコマンド。エージェントのシェル実行ツールから打つ)
 - 完了は `worker_done --outcome <succeeded|failed>` を1回だけ。
   body にマージ方針・解消したコンフリクト・検証結果を書く
 - ツールhookにブロックされたら同じことを別手段で再試行しない。
-  専用read/edit/writeツールと `workdir` パラメータを使う
-  (`cd DIR && cmd`・shell経由のファイル操作はブロックされる)
+  ブロック理由と末尾の「エージェント固有の注意」に書かれた代替手段をそのまま使う
+- 待機は `sleep` ではなく条件待ち(`orca terminal wait` / 条件ループ)
