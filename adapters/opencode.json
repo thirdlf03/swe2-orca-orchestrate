@@ -34,7 +34,13 @@
   },
   "known": [],
   "gated_models": [],
-  "fuzzy": false
+  "fuzzy": false,
+  "list_source": {
+   "cmd": [
+    "opencode",
+    "models"
+   ]
+  }
  },
  "screen": {
   "ready": "ctrl\\+p|tab\\s+agents?|Build\\s",

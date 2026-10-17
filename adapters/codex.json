@@ -37,27 +37,37 @@
   "default_tier": "medium",
   "tiers": {
    "medium": {
-    "model": "gpt-5.5",
+    "model": "gpt-5.6-terra",
     "effort": "medium"
    },
    "high": {
-    "model": "gpt-5.6-terra",
+    "model": "gpt-6-luna",
     "effort": "high"
    },
    "max": {
-    "model": "gpt-5.6-terra",
-    "effort": "xhigh"
+    "model": "gpt-6-luna",
+    "effort": "max"
    }
   },
   "known": [
+   "gpt-6-luna",
    "gpt-5.6-terra",
-   "gpt-5.5",
-   "gpt-5.4",
-   "gpt-5.4-mini",
-   "gpt-5.3-codex"
+   "gpt-5.6-luna"
   ],
   "gated_models": [],
-  "fuzzy": false
+  "fuzzy": false,
+  "list_source": {
+   "json": [
+    "$CODEX_HOME/models_cache.json",
+    "~/.codex/models_cache.json"
+   ],
+   "key": "models",
+   "field": "slug",
+   "skip_if": {
+    "visibility": "hide"
+   }
+  },
+  "_note": "tier は ~/.codex/models_cache.json(2026-10-17 取得)の visibility=list のモデルに合わせた。モデルは頻繁に入れ替わるので更新時は `orch agents` の stale_models と `codex debug models` / 公式ドキュメントで最新を確認する"
  },
  "screen": {
   "ready": "ask codex to do anything|›\\s*$",

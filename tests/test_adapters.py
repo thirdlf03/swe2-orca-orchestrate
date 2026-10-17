@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import tempfile
@@ -21,7 +22,7 @@ class ResolveTest(unittest.TestCase):
     def test_prefixed(self):
         r = A.resolve("codex:max")
         self.assertEqual((r["agent"], r["model"], r["effort"]),
-                         ("codex", "gpt-5.6-terra", "xhigh"))
+                         ("codex", "gpt-6-luna", "max"))
 
     def test_empty_is_default_tier(self):
         self.assertEqual(A.resolve("", agent="devin")["model"], "swe-2-medium")
@@ -141,6 +142,39 @@ class ScreenTest(unittest.TestCase):
         for aid in ("devin", "claude", "codex", "opencode", "generic"):
             self.assertIn(aid, A.list_ids())
             A.load(aid)
+
+
+class ModelFreshnessTest(unittest.TestCase):
+    def _codex_with_cache(self, models):
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "models_cache.json")
+        with open(p, "w") as f:
+            f.write(json.dumps({"models": models}))
+        a = json.loads(json.dumps(A.load("codex")))
+        a["models"]["list_source"]["json"] = [p]
+        return a
+
+    def test_stale_detected(self):
+        a = self._codex_with_cache([{"slug": "gpt-6-luna",
+                                     "visibility": "list"},
+                                    {"slug": "gpt-5.6-terra",
+                                     "visibility": "hide"}])
+        avail = A.available_models(a)
+        self.assertEqual(avail, ["gpt-6-luna"])
+        self.assertEqual(A.stale_models(a, avail), ["medium=gpt-5.6-terra"])
+
+    def test_fresh_and_unreadable(self):
+        a = self._codex_with_cache([{"slug": "gpt-6-luna"},
+                                    {"slug": "gpt-5.6-terra"}])
+        self.assertEqual(A.stale_models(a, A.available_models(a)), [])
+        a["models"]["list_source"]["json"] = ["/nonexistent/x.json"]
+        self.assertIsNone(A.available_models(a))
+        self.assertEqual(A.stale_models(a, None), [])
+
+    def test_fuzzy_prefix(self):
+        self.assertEqual(A.stale_models(A.load("devin"),
+                                        ["swe-2-medium-0915", "swe-2-high",
+                                         "swe-2-max"]), [])
 
 
 class UserAdapterTest(unittest.TestCase):

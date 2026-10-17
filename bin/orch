@@ -1717,9 +1717,38 @@ def cmd_status(args):
     }, indent=1, ensure_ascii=False))
 
 
+def _model_freshness(a, args):
+    """Compare tier models with the CLI's live model list (only for
+    installed CLIs; --no-models skips the lookup)."""
+    if args.get("--no-models") or not a.get("models", {}).get("list_source"):
+        return {}
+    import shutil
+    if not shutil.which(A.binary(a).split()[0]):
+        return {}
+    avail = A.available_models(a)
+    if avail is None:
+        return {"models_checked": False}
+    out = {"models_checked": True,
+           "stale_models": A.stale_models(a, avail)}
+    if out["stale_models"]:
+        out["available_models"] = avail[:12]
+    return out
+
+
 def cmd_agents(args):
     """List adapters with what this machine can actually run."""
     import shutil
+    if args.get("--check"):
+        # what spawn would run — no terminal is created
+        r = _resolve_model(_agent_spec(args["--check"], args)
+                           if isinstance(args["--check"], str) else "", None)
+        a = A.load(r["agent"])
+        print(json.dumps({"resolved": r,
+                          "command": A.launch_command(a, r,
+                                                      _hook_args(r["agent"])),
+                          "gated": A.is_gated(r)}, indent=1,
+                         ensure_ascii=False))
+        return
     rows = []
     for aid in A.list_ids():
         try:
@@ -1737,23 +1766,13 @@ def cmd_agents(args):
                 (a["models"]["tiers"].get(t) or {}).get("effort") or "") if x)
                 for t in A.TIERS},
             "live": _live_count(a),
+            **_model_freshness(a, args),
             "transcript": (a.get("transcript") or {}).get("reader"),
             "hooks": (a.get("hooks") or {}).get("installer"),
             "unverified": sorted(k for k, v in (a.get("verified") or {}).items()
                                  if v is False),
             "source": os.path.relpath(a["_path"]),
         })
-    if args.get("--check"):
-        # what spawn would run — no terminal is created
-        r = _resolve_model(_agent_spec(args["--check"], args)
-                           if isinstance(args["--check"], str) else "", None)
-        a = A.load(r["agent"])
-        print(json.dumps({"resolved": r,
-                          "command": A.launch_command(a, r,
-                                                      _hook_args(r["agent"])),
-                          "gated": A.is_gated(r)}, indent=1,
-                         ensure_ascii=False))
-        return
     print(json.dumps(rows, indent=1, ensure_ascii=False))
 
 

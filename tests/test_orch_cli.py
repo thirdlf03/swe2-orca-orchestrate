@@ -357,7 +357,7 @@ class OrchCLITest(unittest.TestCase):
         self.assertTrue(self.launch_cmds()[0].startswith("zz-agent --model zh"))
 
     def test_agents_list_and_check(self):
-        rows = json.loads(self.orch("agents").stdout)
+        rows = json.loads(self.orch("agents", "--no-models").stdout)
         self.assertEqual(sorted(r["agent"] for r in rows),
                          ["claude", "codex", "devin", "generic", "opencode"])
         self.assertFalse([r for r in rows if "error" in r])

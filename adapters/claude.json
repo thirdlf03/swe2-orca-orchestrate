@@ -60,7 +60,8 @@
    "fable",
    "claude-fable-5-1"
   ],
-  "fuzzy": false
+  "fuzzy": false,
+  "_note": "tier は CLI のエイリアス(sonnet/opus/fable)で指定し、エイリアスが常に最新モデルを指すようにしている。フル ID を使う場合は `claude --help` / 公式ドキュメントで最新を確認する"
  },
  "screen": {
   "ready": "\\? for shortcuts|bypass permissions on",

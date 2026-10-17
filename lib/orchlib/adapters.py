@@ -158,6 +158,72 @@ def _tier_of_model(a, model):
     return None
 
 
+def available_models(a, timeout=10):
+    """The CLI's own current model list per adapter.models.list_source, or
+    None when there is no source / it can't be read. Model ids rotate
+    faster than adapters get edited (PR review: the codex tiers shipped
+    already stale), so tier mappings are checked against the live list
+    instead of trusting what was true when the JSON was written.
+      {"json": [paths], "key": "models", "field": "slug", "skip_if": {...}}
+      {"cmd": [argv]}   one model id per output line (first token)"""
+    src = (a.get("models") or {}).get("list_source") or {}
+    if src.get("json"):
+        for p in src["json"]:
+            p = os.path.expanduser(os.path.expandvars(p))
+            if "$" in p or not os.path.isfile(p):
+                continue
+            try:
+                with open(p) as f:
+                    doc = json.load(f)
+            except (OSError, ValueError):
+                continue
+            items = doc.get(src.get("key") or "models") if isinstance(
+                doc, dict) else doc
+            skip = src.get("skip_if") or {}
+            out = []
+            for m in items or []:
+                if not isinstance(m, dict):
+                    continue
+                if any(m.get(k) == v for k, v in skip.items()):
+                    continue
+                v = m.get(src.get("field") or "slug")
+                if v:
+                    out.append(str(v))
+            return out
+        return None
+    if src.get("cmd"):
+        import subprocess
+        try:
+            p = subprocess.run(src["cmd"], capture_output=True, text=True,
+                               timeout=timeout, stdin=subprocess.DEVNULL)
+        except Exception:
+            return None
+        if p.returncode != 0:
+            return None
+        out = [ln.split()[0] for ln in p.stdout.splitlines()
+               if ln.strip() and not ln.lstrip().startswith(("#", "-"))]
+        return out or None
+    return None
+
+
+def stale_models(a, avail):
+    """Tier models the CLI no longer lists (fuzzy CLIs match by prefix)."""
+    if not avail:
+        return []
+    low = [m.lower() for m in avail]
+    fuzzy = (a.get("models") or {}).get("fuzzy")
+    out = []
+    for t in TIERS:
+        m = ((a["models"]["tiers"].get(t) or {}).get("model") or "").lower()
+        if not m:
+            continue
+        if m in low or (fuzzy and any(x.startswith(m) or m in x
+                                      for x in low)):
+            continue
+        out.append(f"{t}={m}")
+    return out
+
+
 def is_gated(r):
     """Max-tier gate. The tier itself, or a model on the adapter's
     gated list. For fuzzy-matching CLIs (devin resolves partial names)

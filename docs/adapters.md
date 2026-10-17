@@ -98,7 +98,7 @@ tier 3つ(medium/high/max)の存在、`screen.*` の正規表現のコンパイ�
 - `claude:high` — claude の high tier(= opus)
 - `high` — 既定エージェントの high。既定は `--agent` > `ORCH_AGENT` > run state(`orch boot --agent`)> devin
 - `swe-2-high` — `models.known` にある id は agent を逆引き(→ devin)。後方互換
-- `codex:gpt-5.4` — agent 付きなら known に無い id もそのまま渡る(tier は tiers の model と一致すれば付く)
+- `codex:gpt-5.6-luna` — agent 付きなら known に無い id もそのまま渡る(tier は tiers の model と一致すれば付く)
 - 空 — 既定エージェントの `default_tier`
 
 `spawn/compete/integrate/agents --check` の `--agent X` と、manifest の
@@ -131,62 +131,87 @@ $ orch agents --check claude:high
 ## 新しいエージェントを足す
 
 `.orch/adapters/<id>.json`(repo 限定)か `$ORCH_ADAPTERS_DIR/<id>.json` に置く。
-`adapters/generic.json` をコピーして埋めるのが早い。例: Gemini CLI
-(バイパスは Orca のエージェントフラグ表にある `--yolo`)。
+`adapters/generic.json` をコピーして埋めるのが早い。例: Antigravity
+(Orca の既知エージェント。月次ログでも 7 dispatch で使われていた。
+バイパスは Orca のフラグ表にある `--dangerously-skip-permissions`)。
 
 ```json
 {
- "id": "gemini",
- "description": "Gemini CLI (Google)",
+ "id": "antigravity",
+ "description": "Antigravity CLI (Google)",
  "provider": "google",
- "binary": "gemini",
- "binary_env": "ORCH_GEMINI_CMD",
- "process_names": ["gemini", "node"],
+ "binary": "agy",
+ "binary_env": "ORCH_ANTIGRAVITY_CMD",
+ "process_names": ["agy"],
  "liveness": "ps",
  "launch": {
   "argv": ["{binary}", "{model_args}", "{bypass}"],
-  "bypass": ["--yolo"],
-  "model_args": ["-m", "{model}"],
+  "bypass": ["--dangerously-skip-permissions"],
+  "model_args": [],
   "effort_args": [],
   "env": {}
  },
  "models": {
   "default_tier": "medium",
-  "tiers": {
-   "medium": {"model": "gemini-2.5-flash"},
-   "high": {"model": "gemini-2.5-pro"},
-   "max": {"model": "gemini-2.5-pro"}
-  },
-  "known": ["gemini-2.5-flash", "gemini-2.5-pro"],
+  "tiers": {"medium": {}, "high": {}, "max": {}},
+  "known": [],
   "gated_models": [],
   "fuzzy": false
  },
  "screen": {
-  "ready": "Type your message",
-  "input_echo": "^>\\s*{first}",
+  "ready": "",
+  "input_echo": "",
   "pending_paste": "\\[Pasted text",
-  "approval": "Allow execution|Apply this change\\?",
+  "approval": "allow once|allow always|permission required",
   "approval_answer": "always",
   "rate_limit": "RESOURCE_EXHAUSTED|Quota exceeded|429",
-  "startup_prompts": [{"match": "Do you trust this folder", "keys": ["enter"]}]
+  "startup_prompts": [{"match": "Do you trust", "keys": ["enter"]}]
  },
- "readiness": {"strategy": "screen-regex", "timeout_s": 120},
+ "readiness": {"strategy": "orca-tui-idle", "timeout_s": 120},
  "resume_text": "continue — 中断した作業を再開し、ライフサイクル義務(heartbeat / worker_done)を守ること",
  "transcript": {"reader": null},
  "hooks": {"installer": null},
- "spec_notes": "- シェル操作はシェル実行ツールで行う\n- sleep で待たない。条件ループ(until ...; do sleep 2; done)か orca terminal wait を使う",
+ "spec_notes": "- sleep で待たない。条件ループ(until ...; do sleep 2; done)か orca terminal wait を使う",
  "verified": {"launch": false, "ready": false, "approval": false, "rate_limit": false, "hooks": false}
 }
 ```
 
+tiers を空(`{}`)にしておくと `--model` を渡さず CLI の設定に従う。
+モデルを固定したくなったら、下の「モデル id は最新を参照する」の手順で
+**その時点の**一覧から選んで `model_args` と tiers を埋める。
+
 注意:
-- モデル id・画面文言は例。手元の CLI で確認して差し替える(`verified` は確認するまで false)
+- 画面文言は例。手元の CLI で確認して差し替える(`verified` は確認するまで false)
 - `max` を他 tier と同じモデルにする場合でも、max tier の指定は gate される
 - node 製 CLI はプロセス名が `node` になりうる。`process_names` に `node` を入れると
   他の node プロセスも数えるので、`activity_globs` を足すか cap を控えめにする
 - provider を既存と同じにすると cap を共有する(同じアカウントなら同じにする)
 
-確認手順: `orch agents`(found / tiers / unverified)→ `orch agents --check gemini:high`
+確認手順: `orch agents`(found / tiers / unverified / stale_models)→
+`orch agents --check antigravity:high`(起動コマンド)→ 下のスモーク。
+単体テストは `python3 -m unittest discover tests`。
+
+## モデル id は最新を参照する
+
+モデル id はアダプタの JSON より速く入れ替わる(このハーネスの最初の PR でも
+codex の tier が既に古かった)。アダプタを書く・直すときは、記憶や過去の
+ドキュメントではなく**必ずその時点の最新情報**を見て決める。
+
+| エージェント | 最新一覧の見方 |
+|---|---|
+| codex | `codex debug models`、または `~/.codex/models_cache.json` の `visibility: "list"` |
+| devin | `devin models list` |
+| opencode | `opencode models` |
+| claude | `claude --help` のエイリアス(`sonnet` / `opus` / `fable`)。フル ID は公式ドキュメント |
+| その他 | 各 CLI の models コマンドか公式ドキュメント |
+
+- tier にはできるだけ**エイリアス**(常に最新を指す名前)を使う。claude はそうしている
+- `models.list_source` を書いておくと、`orch agents` がその一覧と tier を突き合わせ、
+  一覧から消えたモデルを `stale_models`(例: `high=gpt-5.5`)として出す。
+  一覧が取れない環境では `models_checked: false` になるだけで止まらない
+  - `{"json": ["~/.codex/models_cache.json"], "key": "models", "field": "slug", "skip_if": {"visibility": "hide"}}`
+  - `{"cmd": ["opencode", "models"]}`(1行1モデル、先頭トークンを id とみなす)
+- 定期的に `orch agents` を回し、`stale_models` が出たら tiers を更新する
 (起動コマンド)→ 下のスモーク。単体テストは `python3 -m unittest discover tests`。
 
 ## 未検証チェックリスト

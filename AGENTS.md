@@ -141,8 +141,12 @@ orch weights / orch estimate m.json / orch batch m.json --sort-weight
 | 候補ワーカー | 機械的=medium, 通常=high×1+medium, 創造/曖昧=high以上 | medium は曖昧仕様で確認せず進む実測あり |
 | レビュー/検証 | medium〜high | チェックリスト型監査 |
 
-tier→実モデルの対応はアダプタごと(例: claude high=opus、codex medium=gpt-5.5、
-devin high=swe-2-high)。`orch agents` で確認する。provider を混ぜると
+tier→実モデルの対応はアダプタごと(例: claude high=opus、codex medium=gpt-5.6-terra、
+devin high=swe-2-high)。`orch agents` で確認する。
+モデル id は頻繁に入れ替わるので、アダプタを書く・直すときは必ず各 CLI の最新一覧や
+公式ドキュメントを参照する(手順は [docs/adapters.md](docs/adapters.md) の
+「モデル id は最新を参照する」)。`orch agents` は一覧から消えた tier モデルを
+`stale_models` として報告する。provider を混ぜると
 rate limit が分散する(cap は provider 単位)。
 
 ## やってはいけないこと
