@@ -50,9 +50,7 @@
    }
   },
   "known": [
-   "gpt-6-luna",
-   "gpt-5.6-terra",
-   "gpt-5.6-luna"
+   "gpt-6-luna"
   ],
   "gated_models": [],
   "fuzzy": false,
@@ -67,7 +65,7 @@
     "visibility": "hide"
    }
   },
-  "_note": "tier は全て最新の gpt-6-luna(~/.codex/models_cache.json で priority 最上位・2026-10-17 取得)に揃え、差は effort で付ける。旧世代(gpt-5.6-*)は known に残すが tier には使わない。config.toml の既定モデルは古いことがあるので根拠にしない。更新時は `orch agents` の stale_models と `codex debug models` / 公式ドキュメントで最新を確認する"
+  "_note": "tier は全て最新の gpt-6-luna(~/.codex/models_cache.json で priority 最上位・2026-10-17 取得)に揃え、差は effort で付ける。旧世代は known にも残さない(直接指定したいときは `codex:<id>` と agent を付ければ known 外でも渡る)。config.toml の既定モデルは古いことがあるので根拠にしない。更新時は `orch agents` の stale_models と `codex debug models` / 公式ドキュメントで最新を確認する"
  },
  "screen": {
   "ready": "ask codex to do anything|›\\s*$",

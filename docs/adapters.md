@@ -145,18 +145,24 @@ $ orch agents --check claude:high
  "process_names": ["agy"],
  "liveness": "ps",
  "launch": {
-  "argv": ["{binary}", "{model_args}", "{bypass}"],
+  "argv": ["{binary}", "{model_args}", "{effort_args}", "{bypass}"],
   "bypass": ["--dangerously-skip-permissions"],
-  "model_args": [],
-  "effort_args": [],
+  "model_args": ["--model", "{model}"],
+  "effort_args": ["--effort", "{effort}"],
   "env": {}
  },
  "models": {
   "default_tier": "medium",
-  "tiers": {"medium": {}, "high": {}, "max": {}},
-  "known": [],
+  "tiers": {
+   "medium": {"model": "gemini-4-argon-medium"},
+   "high": {"model": "gemini-4-argon-high"},
+   "max": {"model": "gemini-4-argon-high", "effort": "max"}
+  },
+  "known": ["gemini-4-argon-medium", "gemini-4-argon-high", "gemini-4-argon-low",
+            "gemini-3.8-flash-high", "gemini-3.8-flash-medium", "gemini-3.8-flash-low"],
   "gated_models": [],
-  "fuzzy": false
+  "fuzzy": false,
+  "list_source": {"cmd": ["agy", "models"]}
  },
  "screen": {
   "ready": "",
@@ -176,9 +182,12 @@ $ orch agents --check claude:high
 }
 ```
 
-tiers を空(`{}`)にしておくと `--model` を渡さず CLI の設定に従う。
-モデルを固定したくなったら、下の「モデル id は最新を参照する」の手順で
-**その時点の**一覧から選んで `model_args` と tiers を埋める。
+tiers のモデルは `agy models`(2026-10-18 取得)の最新世代 `gemini-4-argon-*`。
+agy のモデル id は effort 込み(`-low/-medium/-high`)で max 版が無いので、max tier は
+`-high` に `--effort max` を足している(id の接尾辞と `--effort` のどちらが優先されるかは未確認)。
+`gemini-3.8-flash-*` は軽い仕事向けに known にだけ入れた(`antigravity:gemini-3.8-flash-medium` で指定)。
+tiers を空(`{}`)にすると `--model` を渡さず CLI の設定に従う。いずれにせよ、
+モデル id は下の「モデル id は最新を参照する」の手順で**その時点の**一覧から選ぶ。
 
 注意:
 - 画面文言は例。手元の CLI で確認して差し替える(`verified` は確認するまで false)
@@ -202,6 +211,7 @@ codex の tier が既に古かった)。アダプタを書く・直すときは�
 | codex | `codex debug models`、または `~/.codex/models_cache.json` の `visibility: "list"` |
 | devin | `devin models list` |
 | opencode | `opencode models` |
+| antigravity | `agy models` |
 | claude | `claude --help` のエイリアス(`sonnet` / `opus` / `fable`)。フル ID は公式ドキュメント |
 | その他 | 各 CLI の models コマンドか公式ドキュメント |
 
@@ -213,7 +223,6 @@ codex の tier が既に古かった)。アダプタを書く・直すときは�
   - `{"json": ["~/.codex/models_cache.json"], "key": "models", "field": "slug", "skip_if": {"visibility": "hide"}}`
   - `{"cmd": ["opencode", "models"]}`(1行1モデル、先頭トークンを id とみなす)
 - 定期的に `orch agents` を回し、`stale_models` が出たら tiers を更新する
-(起動コマンド)→ 下のスモーク。単体テストは `python3 -m unittest discover tests`。
 
 ## 未検証チェックリスト
 
